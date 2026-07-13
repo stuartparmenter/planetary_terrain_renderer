@@ -3,11 +3,13 @@ use crate::{
     formats::{TerrainConfigLoader, TiffLoader},
     preprocess::{MipPipelines, mip_prepass},
     render::{
-        DepthCopyPipeline, GpuTerrain, GpuTerrainShadow, GpuTerrainView, TerrainItem,
-        TerrainMotionPipeline, TerrainShadowPipelines, TerrainTilingPrepassPipelines,
-        TerrainUniform, TilingPrepassItem, extract_terrain_phases, extract_terrain_uniform,
+        DepthCopyPipeline, GpuTerrain, GpuTerrainShadow, GpuTerrainView,
+        TerrainDeferredCompositePipeline, TerrainItem, TerrainMotionPipeline,
+        TerrainShadowPipelines, TerrainTilingPrepassPipelines, TerrainUniform, TilingPrepassItem,
+        extract_terrain_phases, extract_terrain_uniform,
         prepare_terrain_depth_textures, prepare_terrain_motion_bind_groups, queue_tiling_prepass,
-        terrain_motion_pass, terrain_pass, terrain_shadow_pass, tiling_prepass,
+        terrain_deferred_pass, terrain_motion_pass, terrain_pass, terrain_shadow_pass,
+        tiling_prepass,
     },
     shaders::{InternalShaders, load_terrain_shaders},
     terrain::{TerrainComponents, TerrainConfig},
@@ -25,6 +27,7 @@ use bevy::transform::TransformSystems;
 use bevy::{
     core_pipeline::{
         core_3d::main_opaque_pass_3d,
+        prepass::node::early_prepass,
         schedule::{Core3d, Core3dSystems, camera_driver},
     },
     prelude::*,
@@ -216,13 +219,27 @@ impl Plugin for TerrainPlugin {
             .add_systems(
                 Core3d,
                 (
-                    terrain_pass.before(main_opaque_pass_3d),
-                    // Runs after the opaque meshes so the final scene depth
-                    // is complete — it masks terrain motion vectors against
-                    // it. Still before the temporal upscaler consumes them.
-                    terrain_motion_pass.after(main_opaque_pass_3d),
-                )
-                    .in_set(Core3dSystems::MainPass),
+                    // Must run before `early_deferred_prepass` (its deferred
+                    // meshes depth-test against the terrain, and the depth
+                    // copy at its tail must include it), which is not
+                    // publicly nameable — so run before `early_prepass`,
+                    // the head of the prepass chain. The attachments'
+                    // clear-on-first-use semantics make this equivalent:
+                    // this pass performs the frame's clears, the prepasses
+                    // load, and the `Greater` depth merge composes the same
+                    // either way.
+                    terrain_deferred_pass
+                        .before(early_prepass)
+                        .in_set(Core3dSystems::Prepass),
+                    (
+                        terrain_pass.before(main_opaque_pass_3d),
+                        // Runs after the opaque meshes so the final scene depth
+                        // is complete — it masks terrain motion vectors against
+                        // it. Still before the temporal upscaler consumes them.
+                        terrain_motion_pass.after(main_opaque_pass_3d),
+                    )
+                        .in_set(Core3dSystems::MainPass),
+                ),
             );
     }
 
@@ -241,6 +258,7 @@ impl Plugin for TerrainPlugin {
             .init_resource::<MipPipelines>()
             .init_resource::<DepthCopyPipeline>()
             .init_resource::<SpecializedRenderPipelines<DepthCopyPipeline>>()
+            .init_resource::<TerrainDeferredCompositePipeline>()
             .init_resource::<TerrainMotionPipeline>();
     }
 }

@@ -12,6 +12,9 @@
 #import bevy_pbr::pbr_types::{PbrInput, pbr_input_new}
 #import bevy_pbr::pbr_functions::{calculate_view, apply_pbr_lighting}
 #import bevy_pbr::mesh_types::MESH_FLAGS_SHADOW_RECEIVER_BIT
+#ifdef DEFERRED_PREPASS
+#import bevy_pbr::pbr_deferred_functions::deferred_gbuffer_from_pbr_input
+#endif
 
 struct FragmentInput {
     @builtin(position) clip_position: vec4<f32>,
@@ -21,9 +24,19 @@ struct FragmentInput {
     @location(3) height: f32,
 }
 
+// Under DEFERRED_PREPASS the fragment writes Bevy's packed G-buffer and the
+// lighting-pass id instead of a lit color; the locations match the deferred
+// terrain pipeline's two color targets.
+#ifdef DEFERRED_PREPASS
+struct FragmentOutput {
+    @location(0) deferred: vec4<u32>,
+    @location(1) deferred_lighting_pass_id: u32,
+}
+#else
 struct FragmentOutput {
     @location(0) color: vec4<f32>
 }
+#endif
 
 struct FragmentInfo {
     clip_position: vec4<f32>,
@@ -78,6 +91,9 @@ fn terrain_shadow_factor(world_position: vec3<f32>) -> f32 {
 fn fragment_output(info: ptr<function, FragmentInfo>, output: ptr<function, FragmentOutput>, color: vec4<f32>, surface_gradient: vec3<f32>) {
     let world_position = vec4<f32>(apply_height((*info).world_coordinate, (*info).height), 1.0);
 
+// DEFERRED_PREPASS implies LIGHTING (enforced in `queue_terrain`): the
+// G-buffer output has no color slot for the unlit path, and the packed
+// PbrInput comes from the shared assembly below.
 #ifdef LIGHTING
     var pbr_input: PbrInput                 = pbr_input_new();
     pbr_input.material.base_color           = color;
@@ -87,19 +103,33 @@ fn fragment_output(info: ptr<function, FragmentInfo>, output: ptr<function, Frag
     pbr_input.world_position                = world_position;
     pbr_input.world_normal                  = (*info).world_coordinate.normal;
     pbr_input.N                             = normalize((*info).world_coordinate.normal - surface_gradient);
-    pbr_input.V                             = calculate_view(world_position, pbr_input.is_orthographic);
     // Receive Bevy cascade / contact shadows from mesh casters (spheres, etc.).
     pbr_input.flags                         = MESH_FLAGS_SHADOW_RECEIVER_BIT;
+
+#ifdef DEFERRED_PREPASS
+    // Pack into the G-buffer for the deferred lighting pass (or its
+    // replacement) to shade. The packer applies the gamma / rgb9e5
+    // encodings itself and never reads `V`; the terrain-shadow factor has
+    // no G-buffer slot and is skipped.
+    (*output).deferred                  = deferred_gbuffer_from_pbr_input(pbr_input);
+    // 1 = PBR deferred lighting (`pbr_input_new` default).
+    (*output).deferred_lighting_pass_id = pbr_input.material.deferred_lighting_pass_id;
+#else
+    pbr_input.V = calculate_view(world_position, pbr_input.is_orthographic);
 #ifdef TERRAIN_SHADOW
-    pbr_input.directional_shadow_factor     = terrain_shadow_factor(world_position.xyz);
+    pbr_input.directional_shadow_factor = terrain_shadow_factor(world_position.xyz);
 #endif
 
     (*output).color = apply_pbr_lighting(pbr_input);
+#endif
 #else
     (*output).color = color;
 #endif
 }
 
+// Debug overlays write lit colors — they only exist on the forward path
+// (`FragmentOutput` has no color slot under DEFERRED_PREPASS).
+#ifndef DEFERRED_PREPASS
 fn fragment_debug(info: ptr<function, FragmentInfo>, output: ptr<function, FragmentOutput>, tile: AtlasTile, surface_gradient: vec3<f32>) {
     let normal = normalize((*info).world_coordinate.normal - surface_gradient);
 
@@ -128,6 +158,7 @@ fn fragment_debug(info: ptr<function, FragmentInfo>, output: ptr<function, Fragm
     }
 #endif
 }
+#endif // DEFERRED_PREPASS
 
 @fragment
 fn fragment(input: FragmentInput) -> FragmentOutput {
@@ -142,6 +173,10 @@ fn fragment(input: FragmentInput) -> FragmentOutput {
 
     var output: FragmentOutput;
     fragment_output(&info, &output, color, surface_gradient);
+#ifdef DEFERRED_PREPASS
+    return output;
+#else
     fragment_debug(&info, &output, tile, surface_gradient);
     return FragmentOutput(vec4<f32>(output.color.xyz, 1.0));
+#endif
 }

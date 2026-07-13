@@ -1,4 +1,5 @@
-use crate::shaders::{DEPTH_COPY_SHADER, TERRAIN_MOTION_SHADER};
+use crate::render::terrain_material::terrain_renders_deferred;
+use crate::shaders::{DEFERRED_COMPOSITE_SHADER, DEPTH_COPY_SHADER, TERRAIN_MOTION_SHADER};
 use crate::terrain::TerrainComponents;
 use crate::terrain_data::GpuTileAtlas;
 use bevy::{
@@ -6,12 +7,14 @@ use bevy::{
     core_pipeline::{
         FullscreenShader,
         core_3d::CORE_3D_DEPTH_FORMAT,
+        deferred::{DEFERRED_LIGHTING_PASS_ID_FORMAT, DEFERRED_PREPASS_FORMAT},
         prepass::{
-            MOTION_VECTOR_PREPASS_FORMAT, PreviousViewData, PreviousViewUniformOffset,
-            PreviousViewUniforms, ViewPrepassTextures,
+            DeferredPrepass, MOTION_VECTOR_PREPASS_FORMAT, PreviousViewData,
+            PreviousViewUniformOffset, PreviousViewUniforms, ViewPrepassTextures,
         },
     },
     ecs::entity::EntityHash,
+    pbr::DefaultOpaqueRendererMethod,
     prelude::*,
     render::{
         Extract,
@@ -21,7 +24,9 @@ use bevy::{
             SortedPhaseItem, ViewSortedRenderPhases,
         },
         render_resource::{
-            binding_types::{texture_depth_2d, texture_depth_2d_multisampled, uniform_buffer},
+            binding_types::{
+                texture_2d, texture_depth_2d, texture_depth_2d_multisampled, uniform_buffer,
+            },
             *,
         },
         renderer::{RenderContext, RenderDevice, ViewQuery},
@@ -190,7 +195,8 @@ pub fn prepare_terrain_depth_textures(
     depth_copy_pipeline: Res<DepthCopyPipeline>,
     mut depth_copy_pipelines: ResMut<SpecializedRenderPipelines<DepthCopyPipeline>>,
     gpu_tile_atlases: Res<TerrainComponents<GpuTileAtlas>>,
-    views_3d: Query<(Entity, &ExtractedCamera, &Msaa)>,
+    default_opaque_renderer_method: Option<Res<DefaultOpaqueRendererMethod>>,
+    views_3d: Query<(Entity, &ExtractedCamera, &Msaa, Has<DeferredPrepass>)>,
 ) {
     // With no terrain, don't hold a full-resolution depth + stencil target
     // per view. Dropping `TerrainViewDepthTexture` also skips `terrain_pass`
@@ -199,16 +205,17 @@ pub fn prepare_terrain_depth_textures(
     // motion bind group has to go too — it holds views into that texture and
     // would keep it alive.
     if gpu_tile_atlases.is_empty() {
-        for (view, _, _) in &views_3d {
+        for (view, _, _, _) in &views_3d {
             commands
                 .entity(view)
                 .remove::<TerrainViewDepthTexture>()
+                .remove::<TerrainDeferredTargets>()
                 .remove::<TerrainMotionBindGroup>();
         }
         return;
     }
 
-    for (view, camera, msaa) in &views_3d {
+    for (view, camera, msaa, has_deferred_prepass) in &views_3d {
         let Some(physical_target_size) = camera.physical_target_size else {
             continue;
         };
@@ -244,6 +251,104 @@ pub fn prepare_terrain_depth_textures(
             copy_pipeline,
             samples > 1,
         ));
+
+        // Views the terrain renders deferred on additionally get the
+        // private G-buffer targets `terrain_deferred_pass` composites into
+        // the real prepass attachments (see the component docs) — same
+        // gate as every consumer, or the textures would sit resident and
+        // unused. A deferred prepass forces `Msaa::Off`, so these are
+        // always single-sampled.
+        if terrain_renders_deferred(
+            has_deferred_prepass,
+            default_opaque_renderer_method.as_deref(),
+        ) && samples == 1
+        {
+            let color_descriptor = |label, format| TextureDescriptor {
+                label: Some(label),
+                size: Extent3d {
+                    depth_or_array_layers: 1,
+                    width: physical_target_size.x,
+                    height: physical_target_size.y,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            };
+
+            commands.entity(view).insert(TerrainDeferredTargets {
+                gbuffer: texture_cache.get(
+                    &device,
+                    color_descriptor("terrain_deferred_gbuffer", DEFERRED_PREPASS_FORMAT),
+                ),
+                lighting_pass_id: texture_cache.get(
+                    &device,
+                    color_descriptor(
+                        "terrain_deferred_lighting_pass_id",
+                        DEFERRED_LIGHTING_PASS_ID_FORMAT,
+                    ),
+                ),
+            });
+        } else {
+            commands.entity(view).remove::<TerrainDeferredTargets>();
+        }
+    }
+}
+
+/// Color targets of the terrain's two G-buffer outputs — shared by the
+/// deferred terrain pipeline (rendering into the private
+/// [`TerrainDeferredTargets`]) and the composite pipeline (restaging them
+/// into Bevy's prepass attachments). One definition keeps the formats in
+/// lockstep across the two pipelines.
+pub(crate) fn deferred_gbuffer_targets() -> [Option<ColorTargetState>; 2] {
+    [
+        Some(ColorTargetState {
+            format: DEFERRED_PREPASS_FORMAT,
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        }),
+        Some(ColorTargetState {
+            format: DEFERRED_LIGHTING_PASS_ID_FORMAT,
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        }),
+    ]
+}
+
+/// Private single-sampled copies of the deferred G-buffer attachments the
+/// terrain renders into on deferred views. The terrain draw binds Bevy's
+/// mesh-view bind group (group 0), which on those views already contains the
+/// current-frame deferred texture — a texture can't be both bound and
+/// attached in one pass, so the real attachments can't be render targets of
+/// the terrain draw itself. [`terrain_deferred_pass`] renders here and then
+/// composites into the real attachments in a second, depth-gated fullscreen
+/// pass that binds only these private textures.
+#[derive(Component)]
+pub struct TerrainDeferredTargets {
+    pub gbuffer: CachedTexture,
+    pub lighting_pass_id: CachedTexture,
+}
+
+impl TerrainDeferredTargets {
+    /// Attachments into the private targets: they hold only the current
+    /// frame's terrain, so they always clear (zero = "no terrain here";
+    /// zero also keeps `deferred_lighting_pass_id` at "background" for the
+    /// composite).
+    fn attachments(&self) -> [Option<RenderPassColorAttachment<'_>>; 2] {
+        fn attach(texture: &CachedTexture) -> RenderPassColorAttachment<'_> {
+            RenderPassColorAttachment {
+                view: &texture.default_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(LinearRgba::NONE.into()),
+                    store: StoreOp::Store,
+                },
+            }
+        }
+        [Some(attach(&self.gbuffer)), Some(attach(&self.lighting_pass_id))]
     }
 }
 
@@ -335,16 +440,35 @@ pub fn terrain_pass(
         &ViewTarget,
         &ViewDepthTexture,
         &TerrainViewDepthTexture,
+        Has<DeferredPrepass>,
         Option<&MainPassResolutionOverride>,
     )>,
     mut ctx: RenderContext,
     terrain_phases: Res<ViewSortedRenderPhases<TerrainItem>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
+    default_opaque_renderer_method: Option<Res<DefaultOpaqueRendererMethod>>,
 ) {
     let view_entity = view.entity();
-    let (camera, extracted_view, target, depth, terrain_depth, resolution_override) =
-        view.into_inner();
+    let (
+        camera,
+        extracted_view,
+        target,
+        depth,
+        terrain_depth,
+        has_deferred_prepass,
+        resolution_override,
+    ) = view.into_inner();
+
+    // On deferred views the terrain renders through `terrain_deferred_pass`
+    // instead — skip both the color draw and the `Always` depth overwrite
+    // (the phase holds deferred-pipeline items there; see `queue_terrain`).
+    if terrain_renders_deferred(
+        has_deferred_prepass,
+        default_opaque_renderer_method.as_deref(),
+    ) {
+        return;
+    }
 
     let Some(pipeline) = pipeline_cache.get_render_pipeline(terrain_depth.copy_pipeline) else {
         return;
@@ -401,6 +525,204 @@ pub fn terrain_pass(
         });
     pass.set_bind_group(0, &depth_copy_bind_group, &[]);
     pass.set_pipeline(pipeline);
+    pass.draw(0..3, 0..1);
+}
+
+/// Fullscreen pipeline that composites the terrain's private G-buffer
+/// targets (see [`TerrainDeferredTargets`]) into Bevy's real deferred
+/// prepass attachments. The depth test is the merge: `Greater` (reverse-Z)
+/// with depth write, so the terrain's texels and depth land only where the
+/// terrain is the closest surface written to the scene depth so far — sky
+/// pixels (terrain depth 0) never pass against the cleared depth.
+#[derive(Resource)]
+pub struct TerrainDeferredCompositePipeline {
+    layout: BindGroupLayoutDescriptor,
+    id: CachedRenderPipelineId,
+}
+
+impl FromWorld for TerrainDeferredCompositePipeline {
+    fn from_world(world: &mut World) -> Self {
+        let pipeline_cache = world.resource::<PipelineCache>();
+        let fullscreen = world.resource::<FullscreenShader>();
+
+        // Deferred views are always single-sampled (a deferred prepass
+        // forces `Msaa::Off`), so unlike the depth-copy pipeline there is
+        // no multisampled variant.
+        let layout = BindGroupLayoutDescriptor::new(
+            "terrain_deferred_composite_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::FRAGMENT,
+                (
+                    texture_2d(TextureSampleType::Uint),
+                    texture_2d(TextureSampleType::Uint),
+                    texture_depth_2d(),
+                ),
+            ),
+        );
+
+        let id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("terrain_deferred_composite_pipeline".into()),
+            layout: vec![layout.clone()],
+            immediate_size: 0,
+            vertex: fullscreen.to_vertex_state(),
+            fragment: Some(FragmentState {
+                shader: world.load_asset(DEFERRED_COMPOSITE_SHADER),
+                shader_defs: vec![],
+                entry_point: Some("fragment".into()),
+                targets: deferred_gbuffer_targets().to_vec(),
+                constants: vec![],
+            }),
+            primitive: default(),
+            depth_stencil: Some(DepthStencilState {
+                format: CORE_3D_DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Greater),
+                stencil: default(),
+                bias: default(),
+            }),
+            multisample: default(),
+            zero_initialize_workgroup_memory: false,
+        });
+
+        Self { layout, id }
+    }
+}
+
+/// Deferred-view counterpart of [`terrain_pass`]: renders the terrain phase
+/// into the private [`TerrainDeferredTargets`] with the private terrain
+/// depth, then composites texels + depth into Bevy's real deferred G-buffer
+/// attachments and the scene depth in one depth-gated fullscreen pass, so
+/// the deferred lighting pass — or its replacement — shades the terrain
+/// like any other deferred geometry. The private indirection exists because
+/// the terrain draw's mesh-view bind group contains the current-frame
+/// deferred texture on these views (see [`TerrainDeferredTargets`]).
+///
+/// Scheduled before `early_prepass` (see `plugin.rs`): the composite's
+/// `get_attachment()` calls are the frame's first use of the deferred
+/// attachments and the scene depth, so they perform the frame's clears and
+/// the prepasses load on top; the prepass and deferred meshes depth-test
+/// against the merged terrain depth; and the depth copy at the tail of
+/// `early_deferred_prepass` restages the scene depth (terrain included)
+/// into the prepass depth texture that the lighting passes read.
+///
+/// KNOWN LIMITATION: motion vectors for the terrain are only written by
+/// `terrain_motion_pass`, after the main opaque pass — consumers that read
+/// them earlier (e.g. temporal reuse during the lighting pass) see the
+/// background's camera-at-infinity motion on terrain pixels and reset their
+/// history there while the camera translates. Fixing this requires writing
+/// camera-only motion in this pass (previous-view uniforms are not bound in
+/// the terrain's group 0) or an early motion pass.
+pub fn terrain_deferred_pass(
+    world: &World,
+    view: ViewQuery<
+        (
+            &ExtractedCamera,
+            &ExtractedView,
+            &ViewPrepassTextures,
+            &ViewDepthTexture,
+            &TerrainViewDepthTexture,
+            &TerrainDeferredTargets,
+            Option<&MainPassResolutionOverride>,
+        ),
+        With<DeferredPrepass>,
+    >,
+    mut ctx: RenderContext,
+    terrain_phases: Res<ViewSortedRenderPhases<TerrainItem>>,
+    pipeline_cache: Res<PipelineCache>,
+    render_device: Res<RenderDevice>,
+    composite_pipeline: Res<TerrainDeferredCompositePipeline>,
+    default_opaque_renderer_method: Option<Res<DefaultOpaqueRendererMethod>>,
+) {
+    // Same gate as `queue_terrain` (the `With<DeferredPrepass>` filter
+    // supplies the view half) — with a forward default, a view with a
+    // deferred prepass still renders the terrain forward.
+    if !terrain_renders_deferred(true, default_opaque_renderer_method.as_deref()) {
+        return;
+    }
+
+    let view_entity = view.entity();
+    let (
+        camera,
+        extracted_view,
+        prepass_textures,
+        depth,
+        terrain_depth,
+        deferred_targets,
+        resolution_override,
+    ) = view.into_inner();
+
+    let Some(pipeline) = pipeline_cache.get_render_pipeline(composite_pipeline.id) else {
+        return;
+    };
+
+    let Some(terrain_phase) = terrain_phases.get(&extracted_view.retained_view_entity) else {
+        return;
+    };
+
+    if terrain_phase.items.is_empty() {
+        return;
+    }
+
+    // Both attachments exist on `DeferredPrepass` views.
+    let (Some(deferred), Some(deferred_lighting_pass_id)) = (
+        &prepass_textures.deferred,
+        &prepass_textures.deferred_lighting_pass_id,
+    ) else {
+        return;
+    };
+
+    // Todo: prepare this in a separate system
+    let composite_layout = pipeline_cache.get_bind_group_layout(&composite_pipeline.layout);
+    let composite_bind_group = render_device.create_bind_group(
+        None,
+        &composite_layout,
+        &BindGroupEntries::sequential((
+            &deferred_targets.gbuffer.default_view,
+            &deferred_targets.lighting_pass_id.default_view,
+            &terrain_depth.depth_view,
+        )),
+    );
+
+    // call this here, otherwise the order between passes is incorrect
+    let private_color_attachments = deferred_targets.attachments();
+    let terrain_depth_stencil_attachment = Some(terrain_depth.get_attachment());
+    let composite_color_attachments = [
+        Some(deferred.get_attachment()),
+        Some(deferred_lighting_pass_id.get_attachment()),
+    ];
+    let depth_stencil_attachment = Some(depth.get_attachment(StoreOp::Store));
+
+    let viewport =
+        Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution_override);
+
+    {
+        let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("terrain_deferred_pass"),
+            color_attachments: &private_color_attachments,
+            depth_stencil_attachment: terrain_depth_stencil_attachment,
+            ..default()
+        });
+
+        if let Some(viewport) = &viewport {
+            pass.set_camera_viewport(viewport);
+        }
+
+        terrain_phase.render(&mut pass, world, view_entity).unwrap();
+    }
+
+    let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("terrain_deferred_composite_pass"),
+        color_attachments: &composite_color_attachments,
+        depth_stencil_attachment,
+        ..default()
+    });
+
+    if let Some(viewport) = &viewport {
+        pass.set_camera_viewport(viewport);
+    }
+
+    pass.set_bind_group(0, &composite_bind_group, &[]);
+    pass.set_render_pipeline(pipeline);
     pass.draw(0..3, 0..1);
 }
 
@@ -534,12 +856,16 @@ pub fn terrain_motion_pass(
         &TerrainMotionBindGroup,
         &ViewUniformOffset,
         &PreviousViewUniformOffset,
+        Has<DeferredPrepass>,
+        Has<TerrainDeferredTargets>,
         Option<&MainPassResolutionOverride>,
     )>,
     mut ctx: RenderContext,
     pipeline_cache: Res<PipelineCache>,
     terrain_motion_pipeline: Res<TerrainMotionPipeline>,
+    composite_pipeline: Res<TerrainDeferredCompositePipeline>,
     terrain_phases: Res<ViewSortedRenderPhases<TerrainItem>>,
+    default_opaque_renderer_method: Option<Res<DefaultOpaqueRendererMethod>>,
 ) {
     let (
         camera,
@@ -550,20 +876,35 @@ pub fn terrain_motion_pass(
         bind_group,
         view_offset,
         prev_offset,
+        has_deferred_prepass,
+        has_deferred_targets,
         resolution_override,
     ) = view.into_inner();
 
-    // Mirror `terrain_pass`'s guards exactly. It clears and fills the
-    // terrain depth this pass samples, and bails on either condition — so
-    // relaxing them here would sample an uncleared depth texture (writing
-    // motion vectors for last frame's terrain) and restage a depth the
-    // terrain never contributed to.
+    // Mirror the guards of whichever pass rendered the terrain on this view
+    // — `terrain_deferred_pass` on deferred views, `terrain_pass` otherwise
+    // — exactly. That pass clears and fills the terrain depth this pass
+    // samples, and bails on either condition — so relaxing them here would
+    // sample an uncleared depth texture (writing motion vectors for last
+    // frame's terrain) and restage a depth the terrain never contributed to.
+    let terrain_deferred = terrain_renders_deferred(
+        has_deferred_prepass,
+        default_opaque_renderer_method.as_deref(),
+    );
+    let copy_pipeline_ready = if terrain_deferred {
+        has_deferred_targets
+            && pipeline_cache
+                .get_render_pipeline(composite_pipeline.id)
+                .is_some()
+    } else {
+        pipeline_cache
+            .get_render_pipeline(terrain_depth.copy_pipeline)
+            .is_some()
+    };
     let drew_terrain = terrain_phases
         .get(&extracted_view.retained_view_entity)
         .is_some_and(|phase| !phase.items.is_empty())
-        && pipeline_cache
-            .get_render_pipeline(terrain_depth.copy_pipeline)
-            .is_some();
+        && copy_pipeline_ready;
     if !drew_terrain {
         return;
     }

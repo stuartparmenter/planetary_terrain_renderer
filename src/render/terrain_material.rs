@@ -3,6 +3,7 @@ use crate::{
     render::{
         DrawTerrainCommand, GpuTerrainView, SetTerrainBindGroup, SetTerrainViewBindGroup,
         TERRAIN_DEPTH_FORMAT, TerrainItem, TerrainTilingPrepassPipelines,
+        deferred_gbuffer_targets,
     },
     shaders::{DEFAULT_FRAGMENT_SHADER, DEFAULT_VERTEX_SHADER},
     spawn::{TerrainsToSpawn, spawn_terrains},
@@ -12,14 +13,17 @@ use crate::{
     terrain_view::TerrainViewComponents,
 };
 use bevy::{
+    core_pipeline::prepass::DeferredPrepass,
     light::EnvironmentMapLight,
+    material::OpaqueRendererMethod,
     pbr::{
-        ExtractedAtmosphere, MaterialExtractionSystems, MeshPipeline, MeshPipelineKey,
-        MeshPipelineSystems, MeshPipelineViewLayoutKey, MeshPipelineViewLayouts,
+        DefaultOpaqueRendererMethod, ExtractedAtmosphere, MaterialExtractionSystems, MeshPipeline,
+        MeshPipelineKey, MeshPipelineSystems, MeshPipelineViewLayoutKey, MeshPipelineViewLayouts,
         RenderMaterialInstance, RenderMaterialInstances, RenderViewLightProbes,
         SetMaterialBindGroup, SetMeshViewBindGroup, SetMeshViewBindingArrayBindGroup, ViewKeyCache,
     },
     prelude::*,
+    reflect::tuple_struct::TupleStruct,
     render::{
         Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
         render_phase::{
@@ -79,6 +83,7 @@ bitflags::bitflags! {
         const ATMOSPHERE         = 1 << 18;
         const ENVIRONMENT_MAP    = 1 << 19;
         const TERRAIN_SHADOW     = 1 << 20;
+        const DEFERRED           = 1 << 21;
         const MSAA_RESERVED_BITS = TerrainPipelineFlags::MSAA_MASK_BITS << TerrainPipelineFlags::MSAA_SHIFT_BITS;
     }
 }
@@ -222,9 +227,31 @@ impl TerrainPipelineFlags {
         if self.contains(TerrainPipelineFlags::TERRAIN_SHADOW) {
             shader_defs.push("TERRAIN_SHADOW".into());
         }
+        if self.contains(TerrainPipelineFlags::DEFERRED) {
+            shader_defs.push("DEFERRED_PREPASS".into());
+        }
 
         shader_defs
     }
+}
+
+/// Whether the terrain renders through the deferred G-buffer on a view:
+/// the view has a deferred prepass AND `OpaqueRendererMethod::Auto`
+/// currently resolves to deferred — the same rule Bevy's opaque materials
+/// follow (`SolariPlugins` sets the default to deferred globally). The
+/// single definition is load-bearing: `queue_terrain`, both render passes,
+/// the motion pass, and the target allocation must agree bit-for-bit or
+/// they skew against each other. The resource's inner method has no public
+/// accessor, so it is read through its `Reflect` tuple-struct impl.
+pub(crate) fn terrain_renders_deferred(
+    has_deferred_prepass: bool,
+    method: Option<&DefaultOpaqueRendererMethod>,
+) -> bool {
+    has_deferred_prepass
+        && method
+            .and_then(|method| method.field(0))
+            .and_then(|field| field.try_downcast_ref::<OpaqueRendererMethod>())
+            .is_some_and(|method| *method == OpaqueRendererMethod::Deferred)
 }
 
 fn extract_terrain_materials<M: Material>(
@@ -335,6 +362,21 @@ impl<M: Material> SpecializedRenderPipeline for TerrainRenderPipeline<M> {
         let mut fragment_shader_defs = shader_defs.clone();
         fragment_shader_defs.push("FRAGMENT".into());
 
+        // On deferred views the fragment writes Bevy's G-buffer instead of
+        // the view target: `terrain_deferred_pass` renders target slots 0
+        // and 1 into the private `TerrainDeferredTargets`. Everything else,
+        // notably the group-0 layout derived from `view_layout_key` and the
+        // private depth/stencil block, is shared with the forward pipeline.
+        let targets = if key.flags.contains(TerrainPipelineFlags::DEFERRED) {
+            deferred_gbuffer_targets().to_vec()
+        } else {
+            vec![Some(ColorTargetState {
+                format: key.color_target_format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })]
+        };
+
         RenderPipelineDescriptor {
             label: None,
             layout: bind_group_layouts,
@@ -359,11 +401,7 @@ impl<M: Material> SpecializedRenderPipeline for TerrainRenderPipeline<M> {
                 shader: self.fragment_shader.clone(),
                 shader_defs: fragment_shader_defs,
                 entry_point: Some("fragment".into()),
-                targets: vec![Some(ColorTargetState {
-                    format: key.color_target_format,
-                    blend: Some(BlendState::REPLACE),
-                    write_mask: ColorWrites::ALL,
-                })],
+                targets,
                 constants: vec![],
             }),
             depth_stencil: Some(DepthStencilState {
@@ -422,19 +460,23 @@ pub(crate) fn queue_terrain<M: Material>(
     gpu_tile_atlases: Res<TerrainComponents<GpuTileAtlas>>,
     gpu_terrain_views: Res<TerrainViewComponents<GpuTerrainView>>,
     view_key_cache: Res<ViewKeyCache>,
+    default_opaque_renderer_method: Option<Res<DefaultOpaqueRendererMethod>>,
     mut views: Query<(
         MainEntity,
         &Msaa,
         &ExtractedView,
         Has<ExtractedAtmosphere>,
         Has<RenderViewLightProbes<EnvironmentMapLight>>,
+        Has<DeferredPrepass>,
     )>,
 ) where
     M::Data: PartialEq + Eq + Hash + Clone,
 {
     let draw_function = draw_functions.read().get_id::<DrawTerrain>().unwrap();
 
-    for (view, msaa, extracted_view, has_atmosphere, has_environment_maps) in &mut views {
+    for (view, msaa, extracted_view, has_atmosphere, has_environment_maps, has_deferred_prepass) in
+        &mut views
+    {
         let Some(terrain_phase) = terrain_phases.get_mut(&RetainedViewEntity {
             main_entity: view.into(),
             auxiliary_entity: Entity::PLACEHOLDER.into(),
@@ -486,6 +528,20 @@ pub(crate) fn queue_terrain<M: Material>(
                     | TerrainPipelineFlags::BLEND
                     | TerrainPipelineFlags::SAMPLE_GRAD
                     | TerrainPipelineFlags::HIGH_PRECISION;
+            }
+
+            // On deferred views the same phase holds deferred-pipeline
+            // items, which `terrain_deferred_pass` renders and
+            // `terrain_pass` skips. DEFERRED implies LIGHTING — applied
+            // after the debug flags so a lighting-off toggle can't strip
+            // it: the G-buffer `FragmentOutput` has no color slot for the
+            // unlit path, and the packed PbrInput comes from the shared
+            // LIGHTING assembly.
+            if terrain_renders_deferred(
+                has_deferred_prepass,
+                default_opaque_renderer_method.as_deref(),
+            ) {
+                flags |= TerrainPipelineFlags::DEFERRED | TerrainPipelineFlags::LIGHTING;
             }
 
             let key = TerrainPipelineKey {

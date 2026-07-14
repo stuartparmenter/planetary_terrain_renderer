@@ -605,13 +605,16 @@ impl FromWorld for TerrainDeferredCompositePipeline {
 /// `early_deferred_prepass` restages the scene depth (terrain included)
 /// into the prepass depth texture that the lighting passes read.
 ///
-/// KNOWN LIMITATION: motion vectors for the terrain are only written by
-/// `terrain_motion_pass`, after the main opaque pass — consumers that read
-/// them earlier (e.g. temporal reuse during the lighting pass) see the
-/// background's camera-at-infinity motion on terrain pixels and reset their
-/// history there while the camera translates. Fixing this requires writing
-/// camera-only motion in this pass (previous-view uniforms are not bound in
-/// the terrain's group 0) or an early motion pass.
+/// The pass tail also writes the terrain's (camera-only) motion vectors —
+/// the same fullscreen reprojection `terrain_motion_pass` runs later — so
+/// consumers that read motion vectors before the main pass (bevy_solari's
+/// temporal reuse in the lighting pass) see real terrain motion. Without
+/// it, terrain pixels hold the cleared-black ZERO motion during lighting
+/// (the merged terrain depth makes Bevy's `background_motion_vectors` draw
+/// fail its depth==0 test there, and no mesh covers them), so a translating
+/// camera reprojects ground history from the wrong texels — on flat ground
+/// the wrong reservoirs even pass solari's tangent-plane similarity test,
+/// which shows up as bright crawling noise around moving shadow edges.
 pub fn terrain_deferred_pass(
     world: &World,
     view: ViewQuery<
@@ -622,6 +625,9 @@ pub fn terrain_deferred_pass(
             &ViewDepthTexture,
             &TerrainViewDepthTexture,
             &TerrainDeferredTargets,
+            Option<&TerrainMotionBindGroup>,
+            Option<&ViewUniformOffset>,
+            Option<&PreviousViewUniformOffset>,
             Option<&MainPassResolutionOverride>,
         ),
         With<DeferredPrepass>,
@@ -631,6 +637,7 @@ pub fn terrain_deferred_pass(
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     composite_pipeline: Res<TerrainDeferredCompositePipeline>,
+    motion_pipeline: Res<TerrainMotionPipeline>,
     default_opaque_renderer_method: Option<Res<DefaultOpaqueRendererMethod>>,
 ) {
     // Same gate as `queue_terrain` (the `With<DeferredPrepass>` filter
@@ -648,6 +655,9 @@ pub fn terrain_deferred_pass(
         depth,
         terrain_depth,
         deferred_targets,
+        motion_bind_group,
+        view_offset,
+        prev_view_offset,
         resolution_override,
     ) = view.into_inner();
 
@@ -710,20 +720,58 @@ pub fn terrain_deferred_pass(
         terrain_phase.render(&mut pass, world, view_entity).unwrap();
     }
 
-    let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
-        label: Some("terrain_deferred_composite_pass"),
-        color_attachments: &composite_color_attachments,
-        depth_stencil_attachment,
-        ..default()
-    });
+    {
+        let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("terrain_deferred_composite_pass"),
+            color_attachments: &composite_color_attachments,
+            depth_stencil_attachment,
+            ..default()
+        });
 
-    if let Some(viewport) = &viewport {
-        pass.set_camera_viewport(viewport);
+        if let Some(viewport) = &viewport {
+            pass.set_camera_viewport(viewport);
+        }
+
+        pass.set_bind_group(0, &composite_bind_group, &[]);
+        pass.set_render_pipeline(pipeline);
+        pass.draw(0..3, 0..1);
     }
 
-    pass.set_bind_group(0, &composite_bind_group, &[]);
-    pass.set_render_pipeline(pipeline);
-    pass.draw(0..3, 0..1);
+    // Early camera-only terrain motion vectors (see the doc comment). Same
+    // pipeline + bind group as `terrain_motion_pass`, reading the terrain
+    // depth the composite just merged; the scene depth's GreaterEqual test
+    // is a formality here (only terrain has been drawn). Skipped while the
+    // pipeline compiles or on views without motion vectors — the prepass
+    // then clears the texture as before.
+    if let (Some(motion_vectors), Some(motion_bind_group), Some(view_offset), Some(prev_offset)) = (
+        prepass_textures.motion_vectors.as_ref(),
+        motion_bind_group,
+        view_offset,
+        prev_view_offset,
+    ) && let Some(motion_pipeline) = pipeline_cache.get_render_pipeline(motion_pipeline.id)
+    {
+        let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("terrain_early_motion_pass"),
+            // First use this frame → performs the BLACK clear; the mesh
+            // prepass loads on top and overwrites its own pixels, and
+            // `background_motion_vectors` still fills depth==0 sky.
+            color_attachments: &[Some(motion_vectors.get_attachment())],
+            depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
+            ..default()
+        });
+
+        if let Some(viewport) = &viewport {
+            pass.set_camera_viewport(viewport);
+        }
+
+        pass.set_render_pipeline(motion_pipeline);
+        pass.set_bind_group(
+            0,
+            &motion_bind_group.0,
+            &[view_offset.offset, prev_offset.offset],
+        );
+        pass.draw(0..3, 0..1);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +788,12 @@ pub fn terrain_deferred_pass(
 // untouched. Mirrors Bevy's `background_motion_vectors`, restricted to
 // terrain depth. Only meaningful with a temporal upscaler, which forces
 // `Msaa::Off`, so it is built single-sampled.
+//
+// On deferred views the tail of `terrain_deferred_pass` already ran the
+// same reprojection before the prepasses (early enough for solari's
+// temporal reuse); this late pass then rewrites identical values on
+// terrain pixels — kept for forward views, as the post-mesh safety net,
+// and for the DLSS prepass-depth restage below.
 // ---------------------------------------------------------------------------
 
 #[derive(Resource)]

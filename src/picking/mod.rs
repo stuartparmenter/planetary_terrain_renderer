@@ -142,11 +142,11 @@ pub struct PickingData {
     buffer: Handle<ShaderBuffer>,
 }
 
-impl SyncComponent for PickingData {
+impl SyncComponent<bevy::render::RenderApp> for PickingData {
     type Target = GpuPickingBuffer;
 }
 
-impl ExtractComponent for PickingData {
+impl ExtractComponent<bevy::render::RenderApp> for PickingData {
     type QueryData = &'static PickingData;
     type QueryFilter = ();
     type Out = GpuPickingBuffer;

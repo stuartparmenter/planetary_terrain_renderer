@@ -18,6 +18,11 @@ use bevy::{
 use big_space::prelude::CellCoord;
 use std::collections::VecDeque;
 
+/// Upper bound on attachment bytes staged for GPU upload per frame and atlas.
+/// This bounds the `write_texture` cost of `GpuTileAtlas::prepare` — draining
+/// a whole loader burst in one frame stalls it for several milliseconds.
+const UPLOAD_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
 /// The current state of a tile of a [`TileAtlas`].
 ///
 /// This indicates, whether the tile is loading or loaded and ready to be used.
@@ -37,6 +42,11 @@ struct TileState {
     atlas_index: u32,
     /// The count of [`TileTrees`] that have requested this tile.
     requests: u32,
+    /// Identifies the `request_tile` insert that created this state. Issued
+    /// loads carry this generation, and only matching results may decrement
+    /// the `Loading` counter — a coordinate can be evicted and re-requested
+    /// while loads for its predecessor are still in flight or queued.
+    generation: u32,
 }
 
 // Todo: rename to terrain?
@@ -66,10 +76,15 @@ pub struct TileAtlas {
     pub(crate) uploading_tiles: Vec<AttachmentTileWithData>,
     pub(crate) downloading_tiles: Vec<Task<AttachmentTileWithData>>,
     pub(crate) to_load: Vec<AttachmentTile>,
+    /// Attachments that finished loading, waiting on [`Self::stage_uploads`]'s
+    /// per-frame byte budget before entering `uploading_tiles`.
+    pending_uploads: VecDeque<(AttachmentTile, AttachmentData)>,
     /// Tiles that became resident this update, drained into [`TerrainTileReady`] messages.
     ready_tiles: Vec<(TileCoordinate, u32)>,
     /// Ready tiles that were evicted this update, drained into [`TerrainTileDropped`] messages.
     dropped_tiles: Vec<(TileCoordinate, u32)>,
+    /// Generation of the most recent tile-state insert (see [`TileState::generation`]).
+    generation: u32,
 
     pub(crate) lod_count: u32,
     pub(crate) min_height: f32,
@@ -95,8 +110,10 @@ impl TileAtlas {
             to_load: default(),
             uploading_tiles: default(),
             downloading_tiles: default(),
+            pending_uploads: default(),
             ready_tiles: default(),
             dropped_tiles: default(),
+            generation: 0,
             lod_count: config.lod_count,
             min_height: config.min_height,
             max_height: config.max_height,
@@ -135,31 +152,81 @@ impl TileAtlas {
     }
 
     pub(crate) fn tile_loaded(&mut self, tile: AttachmentTile, data: AttachmentData) {
-        if let Some(tile_state) = self.tile_states.get_mut(&tile.coordinate) {
-            // The last outstanding attachment flips the tile to `Loaded`; that is the
-            // once-per-tile edge at which the tile becomes sampleable.
-            let became_ready = matches!(tile_state.state, LoadingState::Loading(1));
+        // A load that outlived its tile state — the slot was evicted, and
+        // possibly re-requested under a newer generation — must not enter the
+        // queue: it belongs to the evicted predecessor, not the state now at
+        // this coordinate.
+        if !self.tile_generation_matches(&tile) {
+            return;
+        }
 
-            tile_state.state = match tile_state.state {
-                LoadingState::Loading(1) => LoadingState::Loaded,
-                LoadingState::Loading(n) => LoadingState::Loading(n - 1),
-                LoadingState::Loaded => {
-                    panic!("Loaded more attachments, than registered with the tile atlas.")
-                }
-            };
+        // Deferred to `stage_uploads`: the tile's `Loaded` flip — which makes
+        // `get_best_tile` serve it to the tile trees and fires
+        // [`TerrainTileReady`] — has to stay on the frame its data enters
+        // `uploading_tiles`, or the shader would sample the slot before the
+        // texels arrive.
+        self.pending_uploads.push_back((tile, data));
+    }
 
-            self.uploading_tiles.push(AttachmentTileWithData {
-                atlas_index: tile_state.atlas_index,
-                label: tile.label,
-                data,
-            });
+    fn tile_generation_matches(&self, tile: &AttachmentTile) -> bool {
+        self.tile_states
+            .get(&tile.coordinate)
+            .is_some_and(|tile_state| tile_state.generation == tile.generation)
+    }
 
-            if became_ready {
-                self.ready_tiles
-                    .push((tile.coordinate, tile_state.atlas_index));
+    /// Stages loaded attachments for GPU upload, draining the pending queue
+    /// FIFO up to [`UPLOAD_BUDGET_BYTES`] per frame and carrying the remainder
+    /// over (the first attachment always stages, so an oversized one still
+    /// makes progress). All readiness signals — the `Loaded` flip consumed by
+    /// [`Self::get_best_tile`] and the [`TerrainTileReady`] message — are
+    /// emitted here, on the frame the data reaches `uploading_tiles` and thus
+    /// the GPU.
+    pub(crate) fn stage_uploads(mut tile_atlases: Query<&mut TileAtlas>) {
+        for mut tile_atlas in &mut tile_atlases {
+            let mut staged_bytes = 0;
+            while staged_bytes < UPLOAD_BUDGET_BYTES {
+                let Some((tile, data)) = tile_atlas.pending_uploads.pop_front() else {
+                    break;
+                };
+                staged_bytes += data.bytes().len();
+                tile_atlas.stage_upload(tile, data);
             }
-        } else {
-            dbg!("Tile is no longer loaded.");
+        }
+    }
+
+    fn stage_upload(&mut self, tile: AttachmentTile, data: AttachmentData) {
+        // Backstop for the checks in `tile_loaded` and `request_tile`: an
+        // entry queued for an evicted predecessor of this state must neither
+        // decrement its `Loading` counter nor reach its slot.
+        let Some(tile_state) = self
+            .tile_states
+            .get_mut(&tile.coordinate)
+            .filter(|tile_state| tile_state.generation == tile.generation)
+        else {
+            return;
+        };
+
+        // The last outstanding attachment flips the tile to `Loaded`; that is the
+        // once-per-tile edge at which the tile becomes sampleable.
+        let became_ready = matches!(tile_state.state, LoadingState::Loading(1));
+
+        tile_state.state = match tile_state.state {
+            LoadingState::Loading(1) => LoadingState::Loaded,
+            LoadingState::Loading(n) => LoadingState::Loading(n - 1),
+            LoadingState::Loaded => {
+                panic!("Loaded more attachments, than registered with the tile atlas.")
+            }
+        };
+
+        self.uploading_tiles.push(AttachmentTileWithData {
+            atlas_index: tile_state.atlas_index,
+            label: tile.label,
+            data,
+        });
+
+        if became_ready {
+            self.ready_tiles
+                .push((tile.coordinate, tile_state.atlas_index));
         }
     }
 
@@ -242,6 +309,7 @@ impl TileAtlas {
             let Self {
                 tile_states,
                 dropped_tiles,
+                pending_uploads,
                 ..
             } = self;
             tile_states.retain(|&coordinate, tile| {
@@ -251,8 +319,13 @@ impl TileAtlas {
                 if matches!(tile.state, LoadingState::Loaded) {
                     dropped_tiles.push((coordinate, atlas_index));
                 }
+                // Uploads still queued for the evicted tile must not reach the
+                // slot's next occupant.
+                pending_uploads.retain(|(pending, _)| pending.coordinate != coordinate);
                 false
             });
+
+            self.generation = self.generation.wrapping_add(1);
 
             self.tile_states.insert(
                 tile_coordinate,
@@ -260,6 +333,7 @@ impl TileAtlas {
                     requests: 1,
                     state: LoadingState::Loading(self.attachments.len() as u32),
                     atlas_index,
+                    generation: self.generation,
                 },
             );
 
@@ -267,6 +341,7 @@ impl TileAtlas {
                 self.to_load.push(AttachmentTile {
                     coordinate: tile_coordinate,
                     label: label.clone(),
+                    generation: self.generation,
                 });
             }
         }

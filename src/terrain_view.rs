@@ -21,7 +21,9 @@ pub struct TerrainViewConfig {
     pub tree_size: u32,
     /// The size of the tile buffer.
     pub geometry_tile_count: u32,
-    /// The amount of steps the tile list will be refined.
+    /// The upper bound on the amount of steps the tile list will be refined.
+    /// The effective count is derived from the subdivision distance (one step
+    /// per reachable quadtree level) and only capped by this value.
     pub refinement_count: u32,
     /// The number of rows and columns of the tile grid.
     pub grid_size: u32,

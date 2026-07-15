@@ -6,7 +6,7 @@ use crate::{
         DepthCopyPipeline, GpuTerrain, GpuTerrainShadow, GpuTerrainView,
         TerrainDeferredCompositePipeline, TerrainItem, TerrainMotionPipeline,
         TerrainShadowPipelines, TerrainTilingPrepassPipelines, TerrainUniform, TilingPrepassItem,
-        extract_terrain_phases, extract_terrain_uniform,
+        extract_terrain_phases, extract_terrain_uniform, prepare_terrain_composite_bind_groups,
         prepare_terrain_depth_textures, prepare_terrain_motion_bind_groups, queue_tiling_prepass,
         terrain_deferred_pass, terrain_motion_pass, terrain_pass, terrain_shadow_pass,
         tiling_prepass,
@@ -145,6 +145,7 @@ impl Plugin for TerrainPlugin {
                         cleanup_despawned_terrains,
                         TileTree::compute_requests,
                         finish_loading,
+                        TileAtlas::stage_uploads,
                         TileAtlas::update,
                         TileAtlas::emit_tile_events,
                         start_loading,
@@ -200,7 +201,11 @@ impl Plugin for TerrainPlugin {
                         .in_set(RenderSystems::PrepareBindGroups),
                     sort_phase_system::<TerrainItem>.in_set(RenderSystems::PhaseSort),
                     prepare_terrain_depth_textures.in_set(RenderSystems::PrepareResources),
-                    prepare_terrain_motion_bind_groups.in_set(RenderSystems::PrepareBindGroups),
+                    (
+                        prepare_terrain_motion_bind_groups,
+                        prepare_terrain_composite_bind_groups,
+                    )
+                        .in_set(RenderSystems::PrepareBindGroups),
                     (
                         queue_tiling_prepass,
                         GpuTileAtlas::queue,

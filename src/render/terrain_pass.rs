@@ -142,6 +142,9 @@ pub struct TerrainViewDepthTexture {
     pub stencil_view: TextureView,
     /// Depth-copy pipeline specialized for this view's sample count.
     pub copy_pipeline: CachedRenderPipelineId,
+    /// Bind group of `depth_view` for the depth-copy pass, cached for the
+    /// component's lifetime (it is only recreated alongside the texture).
+    pub copy_bind_group: BindGroup,
     /// Whether the view (and thus this depth texture) is multisampled —
     /// selects the matching depth-copy bind group layout.
     pub multisampled: bool,
@@ -149,6 +152,8 @@ pub struct TerrainViewDepthTexture {
 
 impl TerrainViewDepthTexture {
     pub fn new(
+        device: &RenderDevice,
+        pipeline_cache: &PipelineCache,
         texture: CachedTexture,
         copy_pipeline: CachedRenderPipelineId,
         multisampled: bool,
@@ -162,12 +167,19 @@ impl TerrainViewDepthTexture {
             ..default()
         });
 
+        let copy_bind_group = device.create_bind_group(
+            "depth_copy_bind_group",
+            &pipeline_cache.get_bind_group_layout(&depth_copy_layout(multisampled)),
+            &BindGroupEntries::single(&depth_view),
+        );
+
         Self {
             texture: texture.texture,
             view: texture.default_view,
             depth_view,
             stencil_view,
             copy_pipeline,
+            copy_bind_group,
             multisampled,
         }
     }
@@ -196,26 +208,36 @@ pub fn prepare_terrain_depth_textures(
     mut depth_copy_pipelines: ResMut<SpecializedRenderPipelines<DepthCopyPipeline>>,
     gpu_tile_atlases: Res<TerrainComponents<GpuTileAtlas>>,
     default_opaque_renderer_method: Option<Res<DefaultOpaqueRendererMethod>>,
-    views_3d: Query<(Entity, &ExtractedCamera, &Msaa, Has<DeferredPrepass>)>,
+    views_3d: Query<(
+        Entity,
+        &ExtractedCamera,
+        &Msaa,
+        Has<DeferredPrepass>,
+        Option<&TerrainViewDepthTexture>,
+        Option<&TerrainDeferredTargets>,
+    )>,
 ) {
     // With no terrain, don't hold a full-resolution depth + stencil target
     // per view. Dropping `TerrainViewDepthTexture` also skips `terrain_pass`
     // and `terrain_motion_pass` (both take it in their `ViewQuery`), and not
     // re-fetching the cached texture lets `TextureCache` reclaim it. The
-    // motion bind group has to go too — it holds views into that texture and
-    // would keep it alive.
+    // motion and composite bind groups have to go too — they hold views into
+    // those textures and would keep them alive.
     if gpu_tile_atlases.is_empty() {
-        for (view, _, _, _) in &views_3d {
-            commands
-                .entity(view)
-                .remove::<TerrainViewDepthTexture>()
-                .remove::<TerrainDeferredTargets>()
-                .remove::<TerrainMotionBindGroup>();
+        for (view, _, _, _, existing_depth, existing_targets) in &views_3d {
+            if existing_depth.is_some() || existing_targets.is_some() {
+                commands.entity(view).remove::<(
+                    TerrainViewDepthTexture,
+                    TerrainDeferredTargets,
+                    TerrainMotionBindGroup,
+                    TerrainDeferredCompositeBindGroup,
+                )>();
+            }
         }
         return;
     }
 
-    for (view, camera, msaa, has_deferred_prepass) in &views_3d {
+    for (view, camera, msaa, has_deferred_prepass, existing_depth, existing_targets) in &views_3d {
         let Some(physical_target_size) = camera.physical_target_size else {
             continue;
         };
@@ -237,20 +259,29 @@ pub fn prepare_terrain_depth_textures(
             view_formats: &[],
         };
 
+        // `TextureCache` hands back the same texture while the descriptor
+        // matches (and must be re-queried every frame to keep it alive), so
+        // the views + bind group only need rebuilding — and the component
+        // reinserting — when it actually changed (resize / MSAA switch yield
+        // a different cache entry).
         let cached_texture = texture_cache.get(&device, descriptor);
 
-        // Specialize the depth-copy pass for this view's sample count — the
-        // terrain depth texture is multisampled iff the view is, and the
-        // copy bind group / pipeline must match (fixes single-sampled DLSS
-        // views vs. the old hardcoded 4×).
-        let copy_pipeline =
-            depth_copy_pipelines.specialize(&pipeline_cache, &depth_copy_pipeline, samples);
+        if existing_depth.is_none_or(|depth| depth.texture.id() != cached_texture.texture.id()) {
+            // Specialize the depth-copy pass for this view's sample count —
+            // the terrain depth texture is multisampled iff the view is, and
+            // the copy bind group / pipeline must match (fixes single-sampled
+            // DLSS views vs. the old hardcoded 4×).
+            let copy_pipeline =
+                depth_copy_pipelines.specialize(&pipeline_cache, &depth_copy_pipeline, samples);
 
-        commands.entity(view).insert(TerrainViewDepthTexture::new(
-            cached_texture,
-            copy_pipeline,
-            samples > 1,
-        ));
+            commands.entity(view).insert(TerrainViewDepthTexture::new(
+                &device,
+                &pipeline_cache,
+                cached_texture,
+                copy_pipeline,
+                samples > 1,
+            ));
+        }
 
         // Views the terrain renders deferred on additionally get the
         // private G-buffer targets `terrain_deferred_pass` composites into
@@ -278,21 +309,31 @@ pub fn prepare_terrain_depth_textures(
                 view_formats: &[],
             };
 
-            commands.entity(view).insert(TerrainDeferredTargets {
-                gbuffer: texture_cache.get(
-                    &device,
-                    color_descriptor("terrain_deferred_gbuffer", DEFERRED_PREPASS_FORMAT),
+            let gbuffer = texture_cache.get(
+                &device,
+                color_descriptor("terrain_deferred_gbuffer", DEFERRED_PREPASS_FORMAT),
+            );
+            let lighting_pass_id = texture_cache.get(
+                &device,
+                color_descriptor(
+                    "terrain_deferred_lighting_pass_id",
+                    DEFERRED_LIGHTING_PASS_ID_FORMAT,
                 ),
-                lighting_pass_id: texture_cache.get(
-                    &device,
-                    color_descriptor(
-                        "terrain_deferred_lighting_pass_id",
-                        DEFERRED_LIGHTING_PASS_ID_FORMAT,
-                    ),
-                ),
-            });
-        } else {
-            commands.entity(view).remove::<TerrainDeferredTargets>();
+            );
+
+            if existing_targets.is_none_or(|targets| {
+                targets.gbuffer.texture.id() != gbuffer.texture.id()
+                    || targets.lighting_pass_id.texture.id() != lighting_pass_id.texture.id()
+            }) {
+                commands.entity(view).insert(TerrainDeferredTargets {
+                    gbuffer,
+                    lighting_pass_id,
+                });
+            }
+        } else if existing_targets.is_some() {
+            commands
+                .entity(view)
+                .remove::<(TerrainDeferredTargets, TerrainDeferredCompositeBindGroup)>();
         }
     }
 }
@@ -446,7 +487,6 @@ pub fn terrain_pass(
     mut ctx: RenderContext,
     terrain_phases: Res<ViewSortedRenderPhases<TerrainItem>>,
     pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
     default_opaque_renderer_method: Option<Res<DefaultOpaqueRendererMethod>>,
 ) {
     let view_entity = view.entity();
@@ -482,19 +522,6 @@ pub fn terrain_pass(
         return;
     }
 
-    // Todo: prepare this in a separate system
-    let terrain_depth_view = terrain_depth.texture.create_view(&TextureViewDescriptor {
-        aspect: TextureAspect::DepthOnly,
-        ..default()
-    });
-    let depth_layout =
-        pipeline_cache.get_bind_group_layout(&depth_copy_layout(terrain_depth.multisampled));
-    let depth_copy_bind_group = render_device.create_bind_group(
-        None,
-        &depth_layout,
-        &BindGroupEntries::single(&terrain_depth_view),
-    );
-
     // call this here, otherwise the order between passes is incorrect
     let color_attachments = [Some(target.get_color_attachment())];
     let terrain_depth_stencil_attachment = Some(terrain_depth.get_attachment());
@@ -523,7 +550,7 @@ pub fn terrain_pass(
             depth_stencil_attachment,
             ..default()
         });
-    pass.set_bind_group(0, &depth_copy_bind_group, &[]);
+    pass.set_bind_group(0, &terrain_depth.copy_bind_group, &[]);
     pass.set_pipeline(pipeline);
     pass.draw(0..3, 0..1);
 }
@@ -588,6 +615,55 @@ impl FromWorld for TerrainDeferredCompositePipeline {
     }
 }
 
+/// Per-view bind group for the composite pass of [`terrain_deferred_pass`]:
+/// the private G-buffer targets and the terrain depth. Prepared here instead
+/// of per frame inside the render node.
+#[derive(Component)]
+pub struct TerrainDeferredCompositeBindGroup {
+    bind_group: BindGroup,
+    /// Ids of the constituent texture views; the bind group is rebuilt when
+    /// any of them is reallocated.
+    inputs: (TextureViewId, TextureViewId, TextureViewId),
+}
+
+pub fn prepare_terrain_composite_bind_groups(
+    mut commands: Commands,
+    composite_pipeline: Res<TerrainDeferredCompositePipeline>,
+    pipeline_cache: Res<PipelineCache>,
+    render_device: Res<RenderDevice>,
+    views: Query<(
+        Entity,
+        &TerrainViewDepthTexture,
+        &TerrainDeferredTargets,
+        Option<&TerrainDeferredCompositeBindGroup>,
+    )>,
+) {
+    for (entity, terrain_depth, deferred_targets, existing) in &views {
+        let inputs = (
+            deferred_targets.gbuffer.default_view.id(),
+            deferred_targets.lighting_pass_id.default_view.id(),
+            terrain_depth.depth_view.id(),
+        );
+        if existing.is_some_and(|bind_group| bind_group.inputs == inputs) {
+            continue;
+        }
+
+        let bind_group = render_device.create_bind_group(
+            "terrain_deferred_composite_bind_group",
+            &pipeline_cache.get_bind_group_layout(&composite_pipeline.layout),
+            &BindGroupEntries::sequential((
+                &deferred_targets.gbuffer.default_view,
+                &deferred_targets.lighting_pass_id.default_view,
+                &terrain_depth.depth_view,
+            )),
+        );
+
+        commands
+            .entity(entity)
+            .insert(TerrainDeferredCompositeBindGroup { bind_group, inputs });
+    }
+}
+
 /// Deferred-view counterpart of [`terrain_pass`]: renders the terrain phase
 /// into the private [`TerrainDeferredTargets`] with the private terrain
 /// depth, then composites texels + depth into Bevy's real deferred G-buffer
@@ -625,6 +701,7 @@ pub fn terrain_deferred_pass(
             &ViewDepthTexture,
             &TerrainViewDepthTexture,
             &TerrainDeferredTargets,
+            &TerrainDeferredCompositeBindGroup,
             Option<&TerrainMotionBindGroup>,
             Option<&ViewUniformOffset>,
             Option<&PreviousViewUniformOffset>,
@@ -635,7 +712,6 @@ pub fn terrain_deferred_pass(
     mut ctx: RenderContext,
     terrain_phases: Res<ViewSortedRenderPhases<TerrainItem>>,
     pipeline_cache: Res<PipelineCache>,
-    render_device: Res<RenderDevice>,
     composite_pipeline: Res<TerrainDeferredCompositePipeline>,
     motion_pipeline: Res<TerrainMotionPipeline>,
     default_opaque_renderer_method: Option<Res<DefaultOpaqueRendererMethod>>,
@@ -655,6 +731,7 @@ pub fn terrain_deferred_pass(
         depth,
         terrain_depth,
         deferred_targets,
+        composite_bind_group,
         motion_bind_group,
         view_offset,
         prev_view_offset,
@@ -680,18 +757,6 @@ pub fn terrain_deferred_pass(
     ) else {
         return;
     };
-
-    // Todo: prepare this in a separate system
-    let composite_layout = pipeline_cache.get_bind_group_layout(&composite_pipeline.layout);
-    let composite_bind_group = render_device.create_bind_group(
-        None,
-        &composite_layout,
-        &BindGroupEntries::sequential((
-            &deferred_targets.gbuffer.default_view,
-            &deferred_targets.lighting_pass_id.default_view,
-            &terrain_depth.depth_view,
-        )),
-    );
 
     // call this here, otherwise the order between passes is incorrect
     let private_color_attachments = deferred_targets.attachments();
@@ -732,7 +797,7 @@ pub fn terrain_deferred_pass(
             pass.set_camera_viewport(viewport);
         }
 
-        pass.set_bind_group(0, &composite_bind_group, &[]);
+        pass.set_bind_group(0, &composite_bind_group.bind_group, &[]);
         pass.set_render_pipeline(pipeline);
         pass.draw(0..3, 0..1);
     }
@@ -767,7 +832,7 @@ pub fn terrain_deferred_pass(
         pass.set_render_pipeline(motion_pipeline);
         pass.set_bind_group(
             0,
-            &motion_bind_group.0,
+            &motion_bind_group.bind_group,
             &[view_offset.offset, prev_offset.offset],
         );
         pass.draw(0..3, 0..1);
@@ -858,7 +923,12 @@ impl FromWorld for TerrainMotionPipeline {
 /// Per-view bind group for [`terrain_motion_pass`]: the view + previous-view
 /// uniforms and the terrain / final-scene depth textures.
 #[derive(Component)]
-pub struct TerrainMotionBindGroup(BindGroup);
+pub struct TerrainMotionBindGroup {
+    bind_group: BindGroup,
+    /// Ids of the constituent resources; the bind group is rebuilt when any
+    /// of them is reallocated (view-uniform buffer growth, depth resize).
+    inputs: (BufferId, BufferId, TextureViewId),
+}
 
 pub fn prepare_terrain_motion_bind_groups(
     mut commands: Commands,
@@ -867,36 +937,49 @@ pub fn prepare_terrain_motion_bind_groups(
     view_uniforms: Res<ViewUniforms>,
     prev_view_uniforms: Res<PreviousViewUniforms>,
     render_device: Res<RenderDevice>,
-    views: Query<(Entity, &TerrainViewDepthTexture)>,
+    views: Query<(Entity, &TerrainViewDepthTexture, Option<&TerrainMotionBindGroup>)>,
 ) {
-    let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
-
-    for (entity, terrain_depth) in &views {
+    for (entity, terrain_depth, existing) in &views {
         // Skip bind group creation when the terrain depth
         // texture is multisampled
         if terrain_depth.multisampled {
-            commands.entity(entity).remove::<TerrainMotionBindGroup>();
+            if existing.is_some() {
+                commands.entity(entity).remove::<TerrainMotionBindGroup>();
+            }
             continue;
         }
 
-        // `binding()` is `None` until the (previous-)view uniforms exist,
-        // i.e. only on views with the motion vector prepass (DLSS/TAA).
-        let (Some(view_binding), Some(prev_binding)) = (
-            view_uniforms.uniforms.binding(),
-            prev_view_uniforms.uniforms.binding(),
+        // `buffer()`/`binding()` are `None` until the (previous-)view uniforms
+        // exist, i.e. only on views with the motion vector prepass (DLSS/TAA).
+        let (Some(view_buffer), Some(prev_buffer)) = (
+            view_uniforms.uniforms.buffer(),
+            prev_view_uniforms.uniforms.buffer(),
         ) else {
             continue;
         };
 
+        let inputs = (
+            view_buffer.id(),
+            prev_buffer.id(),
+            terrain_depth.depth_view.id(),
+        );
+        if existing.is_some_and(|bind_group| bind_group.inputs == inputs) {
+            continue;
+        }
+
+        // `binding()` is `Some` iff `buffer()` is, and both were guarded above.
+        let view_binding = view_uniforms.uniforms.binding().unwrap();
+        let prev_binding = prev_view_uniforms.uniforms.binding().unwrap();
+
         let bind_group = render_device.create_bind_group(
             "terrain_motion_bind_group",
-            &layout,
+            &pipeline_cache.get_bind_group_layout(&pipeline.layout),
             &BindGroupEntries::sequential((view_binding, prev_binding, &terrain_depth.depth_view)),
         );
 
         commands
             .entity(entity)
-            .insert(TerrainMotionBindGroup(bind_group));
+            .insert(TerrainMotionBindGroup { bind_group, inputs });
     }
 }
 
@@ -1004,6 +1087,10 @@ pub fn terrain_motion_pass(
     }
 
     pass.set_render_pipeline(pipeline);
-    pass.set_bind_group(0, &bind_group.0, &[view_offset.offset, prev_offset.offset]);
+    pass.set_bind_group(
+        0,
+        &bind_group.bind_group,
+        &[view_offset.offset, prev_offset.offset],
+    );
     pass.draw(0..3, 0..1);
 }

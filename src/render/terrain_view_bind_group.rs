@@ -176,6 +176,10 @@ pub struct GpuTerrainView {
     pub(crate) prepass_view_bind_group: Option<BindGroup>,
     pub(crate) terrain_view_bind_group: Option<BindGroup>,
     terrain_view_debug_layout: Option<bool>,
+    /// Ids of the render-asset buffers `prepass_view_bind_group` was built
+    /// from — those can be reallocated on re-prepare, the directly-owned
+    /// buffers never change.
+    prepass_view_buffers: Option<(BufferId, BufferId, BufferId)>,
 
     indirect: IndirectBindGroup,
     prepass_view: PrepassViewBindGroup,
@@ -240,6 +244,7 @@ impl GpuTerrainView {
             prepass_view_bind_group: None,
             terrain_view_bind_group: None,
             terrain_view_debug_layout: None,
+            prepass_view_buffers: None,
         }
     }
 
@@ -349,18 +354,48 @@ impl GpuTerrainView {
         device: Res<RenderDevice>,
         pipeline_cache: Res<PipelineCache>,
         prepass_pipeline: Res<TerrainTilingPrepassPipelines>,
+        buffers: Res<RenderAssets<GpuShaderBuffer>>,
         mut gpu_terrain_views: ResMut<TerrainViewComponents<GpuTerrainView>>,
-        mut param: StaticSystemParam<<PrepassViewBindGroup as AsBindGroup>::Param>,
     ) {
         for gpu_terrain_view in gpu_terrain_views.values_mut() {
-            // Todo: be smarter about bind group recreation
-            let bind_group = gpu_terrain_view.prepass_view.as_bind_group(
-                &prepass_pipeline.prepass_view_layout,
-                &device,
-                &pipeline_cache,
-                &mut param,
+            let prepass_view = &gpu_terrain_view.prepass_view;
+
+            let (Some(terrain_view_buffer), Some(approximate_height_buffer), Some(tile_tree_buffer)) = (
+                buffers.get(&prepass_view.terrain_view),
+                buffers.get(&prepass_view.approximate_height),
+                buffers.get(&prepass_view.tile_tree),
+            ) else {
+                gpu_terrain_view.prepass_view_bind_group = None;
+                gpu_terrain_view.prepass_view_buffers = None;
+                continue;
+            };
+
+            let buffer_ids = (
+                terrain_view_buffer.buffer.id(),
+                approximate_height_buffer.buffer.id(),
+                tile_tree_buffer.buffer.id(),
             );
-            gpu_terrain_view.prepass_view_bind_group = bind_group.ok().map(|b| b.bind_group);
+            if gpu_terrain_view.prepass_view_bind_group.is_some()
+                && gpu_terrain_view.prepass_view_buffers == Some(buffer_ids)
+            {
+                continue;
+            }
+
+            // Entries mirror the `AsBindGroup` field order of
+            // `PrepassViewBindGroup` (bindings 0..=5).
+            gpu_terrain_view.prepass_view_bind_group = Some(device.create_bind_group(
+                "prepass_view_bind_group",
+                &pipeline_cache.get_bind_group_layout(&prepass_pipeline.prepass_view_layout),
+                &BindGroupEntries::sequential((
+                    terrain_view_buffer.buffer.as_entire_binding(),
+                    approximate_height_buffer.buffer.as_entire_binding(),
+                    tile_tree_buffer.buffer.as_entire_binding(),
+                    prepass_view.final_tiles.as_entire_binding(),
+                    prepass_view.temporary_tiles.as_entire_binding(),
+                    prepass_view.state.as_entire_binding(),
+                )),
+            ));
+            gpu_terrain_view.prepass_view_buffers = Some(buffer_ids);
         }
     }
 }

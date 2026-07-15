@@ -212,6 +212,11 @@ impl AttachmentData {
 pub struct AttachmentTile {
     pub(crate) coordinate: TileCoordinate,
     pub(crate) label: AttachmentLabel,
+    /// The tile-state generation this load was issued under. A completed load
+    /// only counts toward a tile state carrying the same generation, so loads
+    /// issued for an evicted predecessor at the same coordinate cannot corrupt
+    /// its successor's attachment counter (see `request_tile`).
+    pub(crate) generation: u32,
 }
 
 #[derive(Clone)]

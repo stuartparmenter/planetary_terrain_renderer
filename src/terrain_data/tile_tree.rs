@@ -3,11 +3,14 @@ use crate::{
     math::{Coordinate, TerrainShape, TileCoordinate},
     render::{TerrainViewUniform, TileTreeUniform},
     terrain::TerrainConfig,
-    terrain_data::{INVALID_ATLAS_INDEX, INVALID_LOD, TileAtlas},
+    terrain_data::{
+        INVALID_ATLAS_INDEX, INVALID_LOD, TerrainTileDropped, TerrainTileReady, TileAtlas,
+    },
     terrain_view::{TerrainViewComponents, TerrainViewConfig},
 };
 use bevy::{
     asset::RenderAssetUsages,
+    ecs::entity::EntityHashSet,
     math::{DVec2, DVec3, primitives::ViewFrustum},
     prelude::*,
     render::{
@@ -21,6 +24,15 @@ use big_space::prelude::{CellCoord, Grids};
 use itertools::{Itertools, iproduct};
 use ndarray::Array4;
 use std::{cmp::Ordering, iter};
+
+/// View movement (in meters) beyond which [`TileTree::update`] must run again.
+/// `update` is the only place `view_coordinates` refresh, and they anchor the
+/// approximate-height sample (`prepare_prepass.wgsl`); a stale anchor misreads
+/// the height by up to the distance moved times the slope, which inflates the
+/// near-field view distance and collapses the morph/subdivision target lod. A
+/// couple of meters keeps that error below eye height on any plausible slope,
+/// while still skipping the recompute for a stationary view.
+const VIEW_UPDATE_THRESHOLD: f64 = 2.0;
 
 /// The current state of a tile of a [`TileTree`].
 ///
@@ -130,6 +142,17 @@ pub struct TileTree {
     pub(crate) approximate_height: f32,
     pub(crate) order: u32,
 
+    /// View position and approximate height the last time [`Self::update`] ran;
+    /// while the view stays within [`VIEW_UPDATE_THRESHOLD`] of it, the
+    /// tile-state recompute is skipped (see [`Self::refresh_view`]).
+    last_update_view: Option<(DVec3, f32)>,
+    /// Whether [`Self::update`] recomputed the tile states this frame.
+    updated_this_frame: bool,
+    /// Whether [`Self::adjust_to_tile_atlas`] rewrote `data` this frame.
+    adjusted_this_frame: bool,
+    /// Whether any input of the [`TerrainViewUniform`] changed this frame.
+    view_changed_this_frame: bool,
+
     pub(crate) tile_tree_buffer: Handle<ShaderBuffer>,
     pub(crate) terrain_view_buffer: Handle<ShaderBuffer>,
     pub(crate) approximate_height_buffer: Handle<ShaderBuffer>,
@@ -173,21 +196,41 @@ impl TileTree {
 
         let face_size = config.shape.face_size();
 
+        let subdivision_distance =
+            view_config.morph_distance * face_size * (1.0 + view_config.subdivision_tolerance);
+
+        // Each `refine_tiles` pass advances the tile list exactly one quadtree
+        // level (`subdivide` emits children at `lod + 1`, which only the next
+        // pass processes), and a tile that still subdivides in the final pass
+        // is neither finalized nor are its children processed — a hole under
+        // the viewer. So the loop in `tiling_prepass` has to cover the deepest
+        // lod `should_be_divided` can demand: it subdivides while
+        // `view_distance < subdivision_distance / 2^(lod + 1)`, and clamps the
+        // view distance to the same `MIN_VIEW_DISTANCE` assumed here (see
+        // `refine_tiles.wgsl` — the two constants must not drift), so demand
+        // stops at lod `ceil(log2(subdivision_distance / MIN_VIEW_DISTANCE))
+        // - 1`. Covering lods `0..=deepest_lod` takes `deepest_lod + 1` passes
+        // (pass N processes lod N - 1). The configured count stays as an upper
+        // bound, so terrains large enough to exceed it (planetary scale) keep
+        // their configured depth.
+        const MIN_VIEW_DISTANCE: f64 = 0.1;
+        let deepest_lod = ((subdivision_distance / MIN_VIEW_DISTANCE).log2().ceil() - 1.0)
+            .max((config.lod_count - 1) as f64) as u32;
+        let refinement_count = view_config.refinement_count.min(deepest_lod + 1);
+
         Self {
             tree_size: view_config.tree_size,
             lod_count: config.lod_count,
             shape: config.shape,
             geometry_tile_count: view_config.geometry_tile_count,
-            refinement_count: view_config.refinement_count,
+            refinement_count,
             grid_size: view_config.grid_size,
             morph_distance: view_config.morph_distance * face_size,
             blend_distance: view_config.blend_distance * face_size,
             load_distance: view_config.blend_distance
                 * face_size
                 * (1.0 + view_config.load_tolerance),
-            subdivision_distance: view_config.morph_distance
-                * face_size
-                * (1.0 + view_config.subdivision_tolerance),
+            subdivision_distance,
             morph_range: view_config.morph_range,
             blend_range: view_config.blend_range,
             precision_distance: view_config.precision_distance * config.shape.scale_scalar(),
@@ -210,6 +253,10 @@ impl TileTree {
             surface_approximation: default(),
             approximate_height: 0.0,
             order: view_config.order,
+            last_update_view: None,
+            updated_this_frame: true,
+            adjusted_this_frame: true,
+            view_changed_this_frame: true,
             tile_tree_buffer,
             terrain_view_buffer,
             approximate_height_buffer,
@@ -322,6 +369,40 @@ impl TileTree {
         }
     }
 
+    /// Refreshes the per-frame view inputs and recomputes the tile states when
+    /// the view has strayed farther than [`VIEW_UPDATE_THRESHOLD`] from where
+    /// [`Self::update`] last ran.
+    ///
+    /// Tile requests and releases originate exclusively in `update`, so it is
+    /// safe to skip while the view is stationary; `approximate_height` offsets
+    /// the surface the tile distances are measured against, so a
+    /// height-readback jump counts as movement too.
+    fn refresh_view(
+        &mut self,
+        view_local_position: DVec3,
+        view_world_position: Vec3,
+        half_spaces: [Vec4; 6],
+    ) {
+        self.view_changed_this_frame = view_local_position != self.view_local_position
+            || view_world_position != self.view_world_position
+            || half_spaces != self.half_spaces;
+
+        self.view_local_position = view_local_position;
+        self.view_world_position = view_world_position;
+        self.half_spaces = half_spaces;
+
+        self.updated_this_frame = self.last_update_view.is_none_or(|(position, height)| {
+            position.distance_squared(view_local_position)
+                >= VIEW_UPDATE_THRESHOLD * VIEW_UPDATE_THRESHOLD
+                || (height - self.approximate_height).abs() as f64 >= VIEW_UPDATE_THRESHOLD
+        });
+
+        if self.updated_this_frame {
+            self.last_update_view = Some((view_local_position, self.approximate_height));
+            self.update();
+        }
+    }
+
     /// Traverses all tile_trees and updates the tile states,
     /// while selecting newly requested and released tiles.
     #[cfg(feature = "big_space")]
@@ -343,10 +424,11 @@ impl TileTree {
                 .half_spaces
                 .map(|space| space.normal_d());
 
-            tile_tree.view_local_position = view_local_position(&grids, view, transform, cell);
-            tile_tree.view_world_position = transform.translation;
-            tile_tree.half_spaces = half_spaces;
-            tile_tree.update();
+            tile_tree.refresh_view(
+                view_local_position(&grids, view, transform, cell),
+                transform.translation,
+                half_spaces,
+            );
         }
     }
 
@@ -368,10 +450,11 @@ impl TileTree {
                 .half_spaces
                 .map(|space| space.normal_d());
 
-            tile_tree.view_local_position = view_local_position(global_transform);
-            tile_tree.view_world_position = transform.translation;
-            tile_tree.half_spaces = half_spaces;
-            tile_tree.update();
+            tile_tree.refresh_view(
+                view_local_position(global_transform),
+                transform.translation,
+                half_spaces,
+            );
         }
     }
 
@@ -380,8 +463,27 @@ impl TileTree {
     pub(crate) fn adjust_to_tile_atlas(
         mut tile_trees: ResMut<TerrainViewComponents<TileTree>>,
         tile_atlases: Query<&TileAtlas>,
+        mut ready_messages: MessageReader<TerrainTileReady>,
+        mut dropped_messages: MessageReader<TerrainTileDropped>,
     ) {
+        // For an unchanged tile grid, `get_best_tile` output only changes at
+        // residency edges — a tile flipping to `Loaded` or a loaded slot being
+        // evicted — which are exactly what the ready/dropped messages report.
+        // Trees whose `update` was skipped therefore only need re-adjusting
+        // when their terrain reported such an edge this frame.
+        let changed_terrains: EntityHashSet = ready_messages
+            .read()
+            .map(|message| message.terrain)
+            .chain(dropped_messages.read().map(|message| message.terrain))
+            .collect();
+
         for (&(terrain, _view), tile_tree) in tile_trees.iter_mut() {
+            tile_tree.adjusted_this_frame =
+                tile_tree.updated_this_frame || changed_terrains.contains(&terrain);
+            if !tile_tree.adjusted_this_frame {
+                continue;
+            }
+
             let tile_atlas = tile_atlases.get(terrain).unwrap();
 
             for (tile, entry) in iter::zip(&tile_tree.tiles, &mut tile_tree.data) {
@@ -408,6 +510,18 @@ impl TileTree {
         mut buffers: ResMut<Assets<ShaderBuffer>>,
     ) {
         for tile_tree in tile_trees.values() {
+            // Nothing feeding the two buffers changed this frame: the uniform's
+            // inputs are bit-identical and `data` was left untouched by both
+            // `update` and `adjust_to_tile_atlas`. Skipping the `get_mut` also
+            // avoids marking the assets modified, which alone would re-upload
+            // both GPU buffers; an unmodified asset keeps its previously
+            // prepared GPU buffer, so views stay valid.
+            // `adjusted_this_frame` is set to `updated_this_frame || …`, so it
+            // already implies `updated_this_frame` — testing both is redundant.
+            if !tile_tree.adjusted_this_frame && !tile_tree.view_changed_this_frame {
+                continue;
+            }
+
             {
                 let mut terrain_view_buffer =
                     buffers.get_mut(&tile_tree.terrain_view_buffer).unwrap();

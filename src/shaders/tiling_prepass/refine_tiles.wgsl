@@ -15,8 +15,17 @@ fn final_index() -> i32 {
     return atomicAdd(&state.final_index, 1);
 }
 
+// Floor on the view distance driving subdivision. The raw distance approaches
+// zero when the camera touches the approximate surface, which would demand
+// unbounded subdivision — deeper than the CPU-derived refinement count covers,
+// leaving the tile neither finalized nor refined (a hole under the viewer).
+// Must match MIN_VIEW_DISTANCE in `TileTree::new` (tile_tree.rs), which sizes
+// the refinement count to the deepest lod reachable at this floor.
+const MIN_VIEW_DISTANCE: f32 = 0.1;
+
 fn should_be_divided(coordinate: Coordinate, world_coordinate: WorldCoordinate) -> bool {
-    return exp2(f32(coordinate.lod + 1)) < terrain_view.subdivision_distance / world_coordinate.view_distance;
+    let view_distance = max(world_coordinate.view_distance, MIN_VIEW_DISTANCE);
+    return exp2(f32(coordinate.lod + 1)) < terrain_view.subdivision_distance / view_distance;
 }
 
 fn subdivide(tile: TileCoordinate) {

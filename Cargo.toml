@@ -26,7 +26,7 @@ bluenoise_texture = ["bevy/bluenoise_texture"]
 atmosphere_example = ["bevy/free_camera", "bevy/https", "bevy/tonemapping_luts"]
 
 [dependencies]
-bevy = { git = "https://github.com/stuartparmenter/bevy", branch = "hdr-implementation", default-features = false, features = ["3d"] }
+bevy = { git = "https://github.com/stuartparmenter/bevy", branch = "rtg-dev", default-features = false, features = ["3d"] }
 big_space = { git = "https://github.com/mate-h/big_space", branch = "bevy-0.20", features = ["i32"], optional = true }
 tiff = "0.10"
 bytemuck = "1.14"

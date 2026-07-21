@@ -76,6 +76,8 @@ pub(crate) struct TileTreeEntry {
     pub(crate) atlas_lod: u32,
 }
 
+const _: () = assert!(size_of::<TileTreeEntry>() == 8);
+
 impl Default for TileTreeEntry {
     fn default() -> Self {
         Self {
@@ -183,8 +185,7 @@ impl TileTree {
             RenderAssetUsages::all(),
         ));
 
-        let mut approximate_height_buffer =
-            ShaderBuffer::new(vec![0.0f32], RenderAssetUsages::default());
+        let mut approximate_height_buffer = ShaderBuffer::from(vec![0.0f32]);
         approximate_height_buffer.buffer_usage |= BufferUsages::COPY_SRC;
         let approximate_height_buffer = buffers.add(approximate_height_buffer);
 
@@ -532,7 +533,7 @@ impl TileTree {
             {
                 let mut tile_tree_buffer = buffers.get_mut(&tile_tree.tile_tree_buffer).unwrap();
                 tile_tree_buffer.clear();
-                tile_tree_buffer.extend(tile_tree.data.clone().into_iter());
+                tile_tree_buffer.extend_from_slice(tile_tree.data.as_slice().unwrap());
             }
         }
     }

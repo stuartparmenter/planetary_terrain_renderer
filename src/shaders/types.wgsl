@@ -29,7 +29,6 @@ struct TerrainView {
     face: u32,
     lod: u32,
     coordinates: array<ViewCoordinate, 6>,
-    height_scale: f32,
     world_position: vec3<f32>,
     half_spaces: array<vec4<f32>, 6>,
 #ifdef HIGH_PRECISION

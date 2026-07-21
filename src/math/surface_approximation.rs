@@ -1,15 +1,12 @@
 use crate::math::{Coordinate, FACE_MATRICES, SIGMA, TerrainShape};
-use bevy::{
-    math::{DMat3, DVec2, DVec3, Vec3},
-    render::render_resource::ShaderType,
-};
+use bevy::math::{DMat3, DVec2, DVec3, Vec3};
 
 /// Parameters of the view used to compute the position of a location on the sphere's surface relative to the view.
 /// This can be calculated directly using f64 operations, or approximated using a Taylor series and f32 operations.
 ///
 /// The idea behind the approximation, is to map from uv coordinates relative to the view, to world positions relative to the view.
 /// Therefore, we identify a origin tile with sufficiently high lod (origin LOD), that serves as a reference, to which we can compute our relative coordinate using partly integer math.
-#[derive(Clone, Debug, Default, ShaderType)]
+#[derive(Clone, Debug, Default)]
 pub struct SurfaceApproximation {
     /// The constant coefficient of the series.
     /// Describes the offset between the location vertically under view and the view position.

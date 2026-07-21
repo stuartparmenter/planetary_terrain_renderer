@@ -1,5 +1,3 @@
-use core::num::NonZeroU64;
-
 use crate::{
     render::{TerrainViewDepthTexture, terrain_pass},
     shaders::PICKING_SHADER,
@@ -55,6 +53,7 @@ pub fn picking_system(
             stencil: 255,
             world_from_clip: global_transform.to_matrix() * camera.clip_from_view().inverse(),
             cell: IVec3::new(cell.x, cell.y, cell.z),
+            ..default()
         };
         buffer.clear();
         buffer.extend_from_slice(&[data]);
@@ -83,7 +82,7 @@ pub fn picking_system(
             stencil: 255,
             world_from_clip: global_transform.to_matrix() * camera.clip_from_view().inverse(),
             cell: IVec3::ZERO,
-            _pad: 0,
+            ..default()
         };
         buffer.clear();
         buffer.extend_from_slice(&[data]);
@@ -94,11 +93,10 @@ pub fn picking_readback(on: On<ReadbackComplete>, mut picking_data: Query<&mut P
     let GpuPickingData {
         cursor_coords,
         depth,
-        stencil: _stencil,
         world_from_clip,
         cell,
         ..
-    } = bytemuck::pod_read_unaligned(&on.event().data[..size_of::<GpuPickingData>()]);
+    } = bytemuck::pod_read_unaligned(&on.event().data);
 
     let ndc_coords = (2.0 * cursor_coords - 1.0).extend(depth);
 
@@ -179,6 +177,8 @@ pub struct GpuPickingData {
 }
 
 const _: () = assert!(size_of::<GpuPickingData>() == 96);
+const _: () = assert!(core::mem::offset_of!(GpuPickingData, world_from_clip) == 16);
+const _: () = assert!(core::mem::offset_of!(GpuPickingData, cell) == 80);
 
 #[derive(Resource)]
 pub struct PickingPipeline {
@@ -196,7 +196,7 @@ impl FromWorld for PickingPipeline {
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
                 (
-                    storage_buffer_sized(false, NonZeroU64::new(size_of::<GpuPickingData>() as u64)),
+                    storage_buffer_sized(false, BufferSize::new(size_of::<GpuPickingData>() as u64)),
                     texture_depth_2d_multisampled(),
                     texture_2d_multisampled(TextureSampleType::Uint),
                 ),

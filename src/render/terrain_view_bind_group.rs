@@ -2,7 +2,7 @@ use crate::{
     debug::DebugTerrain,
     math::{TileCoordinate, ViewCoordinate},
     render::{TerrainTilingPrepassPipelines, terrain_shadow::GpuTerrainShadow},
-    terrain_data::{TileTree, TileTreeEntry},
+    terrain_data::TileTree,
     terrain_shadow::TerrainShadowUniform,
     terrain_view::TerrainViewComponents,
 };
@@ -112,13 +112,47 @@ pub(crate) struct PrepassState {
     final_index: i32,
 }
 
-#[derive(Default, ShaderType)]
-pub struct TileTreeUniform {
-    #[shader(size(runtime))]
-    pub(crate) entries: Vec<TileTreeEntry>,
+/// GPU mirror of the WGSL `SurfaceApproximation`: six `vec3<f32>` fields,
+/// each padded to the vec3 storage alignment of 16 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct GpuSurfaceApproximation {
+    p: Vec3,
+    _pad0: f32,
+    p_du: Vec3,
+    _pad1: f32,
+    p_dv: Vec3,
+    _pad2: f32,
+    p_duu: Vec3,
+    _pad3: f32,
+    p_duv: Vec3,
+    _pad4: f32,
+    p_dvv: Vec3,
+    _pad5: f32,
 }
 
-#[derive(ShaderType)]
+const _: () = assert!(size_of::<GpuSurfaceApproximation>() == 96);
+
+impl From<&crate::math::SurfaceApproximation> for GpuSurfaceApproximation {
+    fn from(approximation: &crate::math::SurfaceApproximation) -> Self {
+        GpuSurfaceApproximation {
+            p: approximation.p,
+            p_du: approximation.p_du,
+            p_dv: approximation.p_dv,
+            p_duu: approximation.p_duu,
+            p_duv: approximation.p_duv,
+            p_dvv: approximation.p_dvv,
+            ..default()
+        }
+    }
+}
+
+/// Byte-for-byte layout of the WGSL `TerrainView` struct, uploaded raw via
+/// [`ShaderBuffer::extend_from_slice`]. Explicit padding matches the vec3
+/// storage alignment; keep the field order in lockstep with
+/// `shaders/types.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct TerrainViewUniform {
     tree_size: u32,
     geometry_tile_count: u32,
@@ -135,10 +169,17 @@ pub(crate) struct TerrainViewUniform {
     face: u32,
     lod: u32,
     coordinates: [ViewCoordinate; 6],
+    /// Present in the WGSL struct; the CPU side has no value for it and
+    /// writes zero.
+    height_scale: f32,
+    _pad0: f32,
     world_position: Vec3,
+    _pad1: f32,
     half_spaces: [Vec4; 6],
-    surface_approximation: [crate::math::SurfaceApproximation; 6],
+    surface_approximation: [GpuSurfaceApproximation; 6],
 }
+
+const _: () = assert!(size_of::<TerrainViewUniform>() == 848);
 
 impl From<&TileTree> for TerrainViewUniform {
     fn from(tile_tree: &TileTree) -> Self {
@@ -160,10 +201,15 @@ impl From<&TileTree> for TerrainViewUniform {
             coordinates: tile_tree
                 .view_coordinates
                 .map(|view_coordinate| ViewCoordinate::new(view_coordinate, tile_tree.view_lod)),
+            height_scale: 0.0,
+            _pad0: 0.0,
             world_position: tile_tree.view_world_position,
+            _pad1: 0.0,
             half_spaces: tile_tree.half_spaces,
-
-            surface_approximation: tile_tree.surface_approximation.clone(),
+            surface_approximation: tile_tree
+                .surface_approximation
+                .each_ref()
+                .map(GpuSurfaceApproximation::from),
         }
     }
 }

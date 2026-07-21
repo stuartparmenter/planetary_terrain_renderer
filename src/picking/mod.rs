@@ -1,3 +1,5 @@
+use core::num::NonZeroU64;
+
 use crate::{
     render::{TerrainViewDepthTexture, terrain_pass},
     shaders::PICKING_SHADER,
@@ -17,7 +19,7 @@ use bevy::{
         render_asset::RenderAssets,
         render_resource::{
             binding_types::{
-                storage_buffer, texture_2d_multisampled, texture_depth_2d_multisampled,
+                storage_buffer_sized, texture_2d_multisampled, texture_depth_2d_multisampled,
             },
             *,
         },
@@ -54,7 +56,8 @@ pub fn picking_system(
             world_from_clip: global_transform.to_matrix() * camera.clip_from_view().inverse(),
             cell: IVec3::new(cell.x, cell.y, cell.z),
         };
-        buffer.set_data(data);
+        buffer.clear();
+        buffer.extend_from_slice(&[data]);
     }
 }
 
@@ -80,8 +83,10 @@ pub fn picking_system(
             stencil: 255,
             world_from_clip: global_transform.to_matrix() * camera.clip_from_view().inverse(),
             cell: IVec3::ZERO,
+            _pad: 0,
         };
-        buffer.set_data(data);
+        buffer.clear();
+        buffer.extend_from_slice(&[data]);
     }
 }
 
@@ -92,7 +97,8 @@ pub fn picking_readback(on: On<ReadbackComplete>, mut picking_data: Query<&mut P
         stencil: _stencil,
         world_from_clip,
         cell,
-    } = on.event().to_shader_type();
+        ..
+    } = bytemuck::pod_read_unaligned(&on.event().data[..size_of::<GpuPickingData>()]);
 
     let ndc_coords = (2.0 * cursor_coords - 1.0).extend(depth);
 
@@ -113,10 +119,10 @@ pub fn picking_readback(on: On<ReadbackComplete>, mut picking_data: Query<&mut P
 pub fn picking_hook(mut world: DeferredWorld, context: HookContext) {
     let mut buffers = world.resource_mut::<Assets<ShaderBuffer>>();
     let mut buffer = ShaderBuffer::with_size(
-        GpuPickingData::min_size().get() as usize,
+        size_of::<GpuPickingData>() as u64,
         RenderAssetUsages::default(),
     );
-    buffer.buffer_description.usage |= BufferUsages::COPY_SRC;
+    buffer.buffer_usage |= BufferUsages::COPY_SRC;
     let buffer = buffers.add(buffer);
 
     world
@@ -161,14 +167,18 @@ impl ExtractComponent<bevy::render::RenderApp> for PickingData {
 #[derive(Component)]
 pub struct GpuPickingBuffer(AssetId<ShaderBuffer>);
 
-#[derive(Default, Debug, Clone, ShaderType)]
+#[repr(C)]
+#[derive(Default, Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuPickingData {
     pub cursor_coords: Vec2,
     pub depth: f32,
     pub stencil: u32,
     pub world_from_clip: Mat4,
     pub cell: IVec3,
+    pub _pad: u32,
 }
+
+const _: () = assert!(size_of::<GpuPickingData>() == 96);
 
 #[derive(Resource)]
 pub struct PickingPipeline {
@@ -186,7 +196,7 @@ impl FromWorld for PickingPipeline {
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::COMPUTE,
                 (
-                    storage_buffer::<GpuPickingData>(false),
+                    storage_buffer_sized(false, NonZeroU64::new(size_of::<GpuPickingData>() as u64)),
                     texture_depth_2d_multisampled(),
                     texture_2d_multisampled(TextureSampleType::Uint),
                 ),

@@ -187,7 +187,8 @@ impl fmt::Display for TileCoordinate {
     }
 }
 
-#[derive(Copy, Clone, Default, Debug, ShaderType)]
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ViewCoordinate {
     pub xy: IVec2,
     pub uv: Vec2,

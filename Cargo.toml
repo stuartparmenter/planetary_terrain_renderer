@@ -29,7 +29,7 @@ atmosphere_example = ["bevy/free_camera", "bevy/https", "bevy/tonemapping_luts"]
 bevy = { git = "https://github.com/stuartparmenter/bevy", branch = "rtg-dev", default-features = false, features = ["3d"] }
 big_space = { git = "https://github.com/mate-h/big_space", branch = "bevy-0.20", features = ["i32"], optional = true }
 tiff = "0.10"
-bytemuck = "1.14"
+bytemuck = { version = "1.14", features = ["derive"] }
 ndarray = "0.16.1"
 itertools = "0.14.0"
 indexmap = "2.12"

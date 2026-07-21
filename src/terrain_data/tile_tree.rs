@@ -1,7 +1,7 @@
 use crate::{
     floating_origin::view_local_position,
     math::{Coordinate, TerrainShape, TileCoordinate},
-    render::{TerrainViewUniform, TileTreeUniform},
+    render::TerrainViewUniform,
     terrain::TerrainConfig,
     terrain_data::{
         INVALID_ATLAS_INDEX, INVALID_LOD, TerrainTileDropped, TerrainTileReady, TileAtlas,
@@ -15,13 +15,13 @@ use bevy::{
     prelude::*,
     render::{
         gpu_readback::{Readback, ReadbackComplete},
-        render_resource::{BufferUsages, ShaderType},
+        render_resource::BufferUsages,
         storage::ShaderBuffer,
     },
 };
 #[cfg(feature = "big_space")]
 use big_space::prelude::{CellCoord, Grids};
-use itertools::{Itertools, iproduct};
+use itertools::iproduct;
 use ndarray::Array4;
 use std::{cmp::Ordering, iter};
 
@@ -68,7 +68,7 @@ impl Default for TileState {
 /// These entries are synced each frame with their equivalent representations in the
 /// [`GpuTileTree`](super::gpu_tile_tree::GpuTileTree) for access on the GPU.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, ShaderType)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct TileTreeEntry {
     /// The atlas index of the best entry.
     pub(crate) atlas_index: u32,
@@ -175,16 +175,17 @@ impl TileTree {
         ));
 
         let terrain_view_buffer = buffers.add(ShaderBuffer::with_size(
-            TerrainViewUniform::min_size().get() as usize,
+            size_of::<TerrainViewUniform>() as u64,
             RenderAssetUsages::all(),
         ));
         let tile_tree_buffer = buffers.add(ShaderBuffer::with_size(
-            data.len() * size_of::<TileTreeEntry>(),
+            (data.len() * size_of::<TileTreeEntry>()) as u64,
             RenderAssetUsages::all(),
         ));
 
-        let mut approximate_height_buffer = ShaderBuffer::from(0.0);
-        approximate_height_buffer.buffer_description.usage |= BufferUsages::COPY_SRC;
+        let mut approximate_height_buffer =
+            ShaderBuffer::new(vec![0.0f32], RenderAssetUsages::default());
+        approximate_height_buffer.buffer_usage |= BufferUsages::COPY_SRC;
         let approximate_height_buffer = buffers.add(approximate_height_buffer);
 
         commands
@@ -525,13 +526,13 @@ impl TileTree {
             {
                 let mut terrain_view_buffer =
                     buffers.get_mut(&tile_tree.terrain_view_buffer).unwrap();
-                terrain_view_buffer.set_data(TerrainViewUniform::from(tile_tree));
+                terrain_view_buffer.clear();
+                terrain_view_buffer.extend_from_slice(&[TerrainViewUniform::from(tile_tree)]);
             }
             {
                 let mut tile_tree_buffer = buffers.get_mut(&tile_tree.tile_tree_buffer).unwrap();
-                tile_tree_buffer.set_data(TileTreeUniform {
-                    entries: tile_tree.data.clone().into_iter().collect_vec(),
-                });
+                tile_tree_buffer.clear();
+                tile_tree_buffer.extend(tile_tree.data.clone().into_iter());
             }
         }
     }

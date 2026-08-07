@@ -1,14 +1,12 @@
-#define_import_path bevy_terrain::debug
-
-#import bevy_terrain::types::{Coordinate, WorldCoordinate, TileCoordinate, AtlasTile, Blend}
-#ifdef ATMOSPHERE
-#import bevy_terrain::bindings::{terrain_data, terrain_view, geometry_tiles, origins}
-#import bevy_terrain::functions::{compute_subdivision_coordinate}
-#else
-#import bevy_terrain::bindings::{terrain_data, tile_tree, terrain_view, geometry_tiles, origins}
-#import bevy_terrain::functions::{lookup_best, compute_subdivision_coordinate}
-#endif
-#import bevy_pbr::mesh_view_bindings::view
+import bevy_terrain::shaders::types::{Coordinate, WorldCoordinate, TileCoordinate, AtlasTile, Blend};
+@if(ATMOSPHERE)
+import bevy_terrain::shaders::bindings::{terrain_data, terrain_view, geometry_tiles};
+@if(ATMOSPHERE)
+import bevy_terrain::shaders::functions::{compute_subdivision_coordinate};
+@if(!ATMOSPHERE)
+import bevy_terrain::shaders::bindings::{terrain_data, tile_tree, terrain_view, geometry_tiles};
+@if(!ATMOSPHERE)
+import bevy_terrain::shaders::functions::{lookup_best, compute_subdivision_coordinate};
 
 fn index_color(index: u32) -> vec4<f32> {
     var COLOR_ARRAY = array(
@@ -40,21 +38,16 @@ fn checker_color(coordinate: Coordinate, ratio: f32) -> vec4<f32> {
 }
 
 fn show_data_lod(blend: Blend, tile: AtlasTile) -> vec4<f32> {
-#ifdef TILE_TREE_LOD
+    @if(TILE_TREE_LOD)
     let ratio = 0.0;
-#else
+    @if(!TILE_TREE_LOD)
     let ratio = select(0.0, blend.ratio, blend.lod == tile.coordinate.lod);
-#endif
 
     var color = checker_color(tile.coordinate, ratio);
 
     if (ratio > 0.95 && blend.lod == tile.coordinate.lod) {
         color = mix(color, vec4<f32>(0.0), 0.8);
     }
-
-// #ifdef SPHERICAL
-//     color = mix(color, index_color(tile.coordinate.face), 0.3);
-// #endif
 
     return color;
 }
@@ -68,11 +61,10 @@ fn show_geometry_lod(coordinate: Coordinate, tile_index: u32) -> vec4<f32> {
     let target_lod = log2(terrain_view.morph_distance / view_distance);
     let lod        = u32(coordinate.lod);
 
-#ifdef MORPH
+    @if(MORPH)
     let ratio = select(saturate(1.0 - (target_lod - f32(lod)) / terrain_view.morph_range), 0.0, lod == 0);
-#else
+    @if(!MORPH)
     let ratio = 0.0;
-#endif
 
     var color = checker_color(coordinate, ratio);
 
@@ -86,9 +78,8 @@ fn show_geometry_lod(coordinate: Coordinate, tile_index: u32) -> vec4<f32> {
         color = mix(color, vec4<f32>(0.0), 0.8);
     }
 
-#ifdef SPHERICAL
+    @if(SPHERICAL)
     color = mix(color, index_color(coordinate.face), 0.3);
-#endif
 
     if (max(0.0, target_lod) < f32(coordinate.lod) - 1.0 + terrain_view.morph_range) {
         // The view_distance and morph range are not sufficient.
@@ -109,16 +100,16 @@ fn show_geometry_lod(coordinate: Coordinate, tile_index: u32) -> vec4<f32> {
 fn show_tile_tree(coordinate: Coordinate, world_coordinate: WorldCoordinate) -> vec4<f32> {
     let target_lod = log2(terrain_view.load_distance / world_coordinate.view_distance);
 
-#ifdef ATMOSPHERE
     // Full tile-tree lookup needs `tile_tree` in the fragment stage, which exceeds the
     // storage-buffer limit alongside atmosphere view bindings. Use geometry LOD coloring instead.
+    @if(ATMOSPHERE)
     var color = checker_color(coordinate, 0.0);
-#else
+    @if(!ATMOSPHERE)
     let best_lookup = lookup_best(coordinate);
-
+    @if(!ATMOSPHERE)
     var color = checker_color(best_lookup.tile.coordinate, 0.0);
+    @if(!ATMOSPHERE)
     color     = mix(color, vec4<f32>(0.1), tile_tree_outlines(best_lookup.tile_tree_uv));
-#endif
 
     if (fract(target_lod) < 0.01 && target_lod >= 1.0) {
         color = mix(index_color(u32(target_lod)), vec4<f32>(0.0), 0.8);

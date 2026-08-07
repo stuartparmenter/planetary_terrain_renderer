@@ -1,7 +1,7 @@
-#import bevy_terrain::types::{TileCoordinate, GeometryTile, Coordinate, WorldCoordinate, Blend}
-#import bevy_terrain::bindings::{terrain_data, terrain_view, final_tiles, approximate_height, temporary_tiles, state}
-#import bevy_terrain::functions::{compute_subdivision_coordinate, compute_world_coordinate, compute_morph, compute_blend, lookup_tile, apply_height}
-#import bevy_render::maths::affine3_to_square
+import bevy_terrain::shaders::types::{TileCoordinate, GeometryTile, Coordinate, WorldCoordinate, Blend};
+import bevy_terrain::shaders::bindings::{terrain_data, terrain_view, final_tiles, approximate_height, temporary_tiles, state};
+import bevy_terrain::shaders::functions::{compute_subdivision_coordinate, compute_world_coordinate, compute_morph, compute_blend, lookup_tile, apply_height};
+import bevy_render::maths::affine3_to_square;
 
 fn child_index() -> i32 {
     return atomicAdd(&state.child_index, state.counter);
@@ -30,7 +30,7 @@ fn should_be_divided(coordinate: Coordinate, world_coordinate: WorldCoordinate) 
 
 fn subdivide(tile: TileCoordinate) {
     for (var i: u32 = 0u; i < 4u; i = i + 1u) {
-        let child_xy  = vec2<u32>((tile.xy.x << 1u) + (i & 1u), (tile.xy.y << 1u) + (i >> 1u & 1u));
+        let child_xy  = vec2<u32>((tile.xy.x << 1u) + (i & 1u), (tile.xy.y << 1u) + ((i >> 1u) & 1u));
         let child_lod = tile.lod + 1u;
 
         temporary_tiles[child_index()] = TileCoordinate(tile.face, child_lod, child_xy);
@@ -44,7 +44,7 @@ fn frustum_cull_aabb(coordinate: Coordinate) -> bool {
     var aabb_max = vec3<f32>(-3.40282e+38);
 
     for (var i = 0u; i < 4; i = i + 1) {
-        let corner_uv               = vec2<f32>(f32(i & 1u), f32(i >> 1u & 1u));
+        let corner_uv               = vec2<f32>(f32(i & 1u), f32((i >> 1u) & 1u));
         let corner_coordinate       = Coordinate(coordinate.face, coordinate.lod, coordinate.xy, corner_uv);
         let corner_world_coordinate = compute_world_coordinate(corner_coordinate);
         let corner_low              = apply_height(corner_world_coordinate, terrain_data.terrain.min_height);
@@ -71,7 +71,7 @@ fn frustum_cull_sphere(coordinate: Coordinate) -> bool {
     var radius = 0.0;
 
     for (var i = 0u; i < 4; i = i + 1) {
-        let corner_uv               = vec2<f32>(f32(i & 1u), f32(i >> 1u & 1u));
+        let corner_uv               = vec2<f32>(f32(i & 1u), f32((i >> 1u) & 1u));
         let corner_coordinate       = Coordinate(coordinate.face, coordinate.lod, coordinate.xy, corner_uv);
         let corner_world_coordinate = compute_world_coordinate(corner_coordinate);
         let corner_low              = apply_height(corner_world_coordinate, terrain_data.terrain.min_height);
@@ -90,7 +90,7 @@ fn frustum_cull_sphere(coordinate: Coordinate) -> bool {
 }
 
 fn horizon_cull(coordinate: Coordinate, world_coordinate: WorldCoordinate) -> bool {
-#ifndef SPHERICAL
+    @if(!SPHERICAL) {
     // Planar terrain has no horizon to cull against. The sphere/ellipsoid
     // test below divides `min_height` by `scale.y`, which is 1.0 for a
     // plane (vs the planet's minor axis on a sphere): `radius` becomes
@@ -99,7 +99,7 @@ fn horizon_cull(coordinate: Coordinate, world_coordinate: WorldCoordinate) -> bo
     // making the whole terrain invisible at ground level. Skip it; frustum
     // + no-data culling still apply.
     return false;
-#else
+    } @else {
     // Todo: implement high precision supprot for culling
     if (coordinate.lod < 3) { return false; }
     // up to LOD 3, the closest point estimation is not reliable when projecting to adjacent sides
@@ -129,7 +129,7 @@ fn horizon_cull(coordinate: Coordinate, world_coordinate: WorldCoordinate) -> bo
 
     // cull tile, if it is behind the horizon plane and it is inside the horizon cone
     return (vo_vt > vh_vh) && (vo_vt * vo_vt > vh_vh * vt_vt);
-#endif
+    }
 }
 
 fn no_data_cull(coordinate: Coordinate, world_coordinate: WorldCoordinate) -> bool {
@@ -154,7 +154,7 @@ fn prepare_tile(tile: TileCoordinate) -> GeometryTile {
     var ratios: array<f32, 4>;
 
     for (var i = 0u; i < 4; i = i + 1) {
-        let corner_uv               = vec2<f32>(f32(i & 1u), f32(i >> 1u & 1u));
+        let corner_uv               = vec2<f32>(f32(i & 1u), f32((i >> 1u) & 1u));
         let corner_coordinate       = Coordinate(tile.face, tile.lod, tile.xy, corner_uv);
         let corner_world_coordinate = compute_world_coordinate(corner_coordinate);
 

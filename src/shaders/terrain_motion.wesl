@@ -1,6 +1,6 @@
-#import bevy_render::view::View
-#import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import bevy_pbr::view_transformations::uv_to_ndc
+import bevy_render::view::View;
+import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
+import bevy_pbr::render::view_transformations::uv_to_ndc;
 
 // Mirror of Bevy's `PreviousViewUniforms` (bevy_core_pipeline::prepass).
 struct PreviousViewUniforms {

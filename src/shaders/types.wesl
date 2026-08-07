@@ -1,5 +1,3 @@
-#define_import_path bevy_terrain::types
-
 const INVALID_ATLAS_INDEX: u32 = 4294967295u;
 
 struct Terrain {
@@ -31,9 +29,8 @@ struct TerrainView {
     coordinates: array<ViewCoordinate, 6>,
     world_position: vec3<f32>,
     half_spaces: array<vec4<f32>, 6>,
-#ifdef HIGH_PRECISION
+    @if(HIGH_PRECISION)
     surface_approximation: array<SurfaceApproximation, 6>, // must be last field of this struct
-#endif
 }
 
 struct TileCoordinate {
@@ -55,10 +52,10 @@ struct Coordinate {
     lod: u32,
     xy: vec2<u32>,
     uv: vec2<f32>,
-#ifdef FRAGMENT
+    @if(FRAGMENT)
     uv_dx: vec2<f32>,
+    @if(FRAGMENT)
     uv_dy: vec2<f32>,
-#endif
 }
 
 struct WorldCoordinate {
@@ -96,7 +93,7 @@ struct AtlasTile {
     blend_ratio: f32,
 }
 
-#ifdef HIGH_PRECISION
+@if(HIGH_PRECISION)
 struct SurfaceApproximation {
     p: vec3<f32>,
     p_u: vec3<f32>,
@@ -105,7 +102,6 @@ struct SurfaceApproximation {
     p_uv: vec3<f32>,
     p_vv: vec3<f32>,
 }
-#endif
 
 struct BestLookup {
     tile: AtlasTile,
@@ -158,8 +154,8 @@ struct TangentSpace {
 
 struct SampleUV {
     uv: vec2<f32>,
-#ifdef FRAGMENT
+    @if(FRAGMENT)
     dx: vec2<f32>,
+    @if(FRAGMENT)
     dy: vec2<f32>,
-#endif
 }

@@ -1,9 +1,7 @@
-#define_import_path bevy_terrain::heightfield
-
-#import bevy_terrain::types::{Coordinate, Blend, INVALID_ATLAS_INDEX}
-#import bevy_terrain::bindings::terrain_data
-#import bevy_terrain::attachments::{sample_height, sample_height_mask}
-#import bevy_terrain::functions::lookup_tile
+import bevy_terrain::shaders::types::{Coordinate, Blend, INVALID_ATLAS_INDEX};
+import bevy_terrain::shaders::bindings::terrain_data;
+import bevy_terrain::shaders::attachments::{sample_height, sample_height_mask};
+import bevy_terrain::shaders::functions::lookup_tile;
 
 const HEIGHTFIELD_SIGMA: f32 = 0.87 * 0.87;
 
@@ -11,16 +9,16 @@ const HEIGHTFIELD_SIGMA: f32 = 0.87 * 0.87;
 // spherical terrains, or the unit plane for planar ones).
 fn world_to_unit_position(world_position: vec3<f32>, unit_from_world: mat4x4<f32>) -> vec3<f32> {
     let unit = (unit_from_world * vec4<f32>(world_position, 1.0)).xyz;
-#ifdef SPHERICAL
-    return normalize(unit);
-#else
-    return unit;
-#endif
+    @if(SPHERICAL) {
+        return normalize(unit);
+    } @else {
+        return unit;
+    }
 }
 
 // Inverse of the cube-sphere projection in `Coordinate::from_unit_position`.
 fn unit_to_coordinate(unit: vec3<f32>) -> Coordinate {
-#ifdef SPHERICAL
+    @if(SPHERICAL) {
     let abs_u = abs(unit);
     var face: u32;
     var xy: vec2<f32>;
@@ -56,11 +54,11 @@ fn unit_to_coordinate(unit: vec3<f32>) -> Coordinate {
     );
 
     return Coordinate(face, 0u, vec2<u32>(0u), uv);
-#else
+    } @else {
     let uv = clamp(unit.xz + 0.5, vec2(0.0), vec2(1.0));
 
     return Coordinate(0u, 0u, vec2<u32>(0u), uv);
-#endif
+    }
 }
 
 // Samples the terrain height (meters above the ellipsoid) at an arbitrary world position.

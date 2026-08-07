@@ -1,31 +1,25 @@
-#define_import_path bevy_terrain::functions
-
-#ifdef VERTEX
-#import bevy_terrain::bindings::{terrain_data, origins, terrain_view, geometry_tiles, tile_tree, view, approximate_height}
-#endif
-#ifdef PREPASS
-#import bevy_terrain::bindings::{terrain_data, origins, terrain_view, geometry_tiles, tile_tree, view, approximate_height}
-#endif
-#ifdef FRAGMENT
-#import bevy_terrain::bindings::{terrain_data, origins, terrain_view, geometry_tiles, tile_tree, view}
-#endif
-#ifdef SHADOW_COMPUTE
-#import bevy_terrain::bindings::{terrain_data, terrain_view, tile_tree}
-#endif
-#import bevy_terrain::types::{TileCoordinate, WorldCoordinate, TileTree, TileTreeEntry, AtlasTile, Blend, BestLookup, Coordinate, Morph, TangentSpace}
-#import bevy_render::maths::{affine3_to_square, mat2x4_f32_to_mat3x3_unpack}
+@if(VERTEX)
+import bevy_terrain::shaders::bindings::{terrain_data, terrain_view, geometry_tiles, tile_tree, approximate_height};
+@if(PREPASS)
+import bevy_terrain::shaders::bindings::{terrain_data, terrain_view, tile_tree, approximate_height};
+@if(FRAGMENT)
+import bevy_terrain::shaders::bindings::{terrain_data, terrain_view, geometry_tiles, tile_tree};
+@if(SHADOW_COMPUTE)
+import bevy_terrain::shaders::bindings::{terrain_data, terrain_view, tile_tree};
+import bevy_terrain::shaders::types::{TileCoordinate, WorldCoordinate, TileTreeEntry, AtlasTile, Blend, BestLookup, Coordinate, TangentSpace};
+import bevy_render::maths::{affine3_to_square, mat2x4_f32_to_mat3x3_unpack};
 
 const SIGMA = 0.87 * 0.87;
 
 fn high_precision(view_distance: f32) -> bool {
-#ifdef HIGH_PRECISION
-    return view_distance < terrain_view.precision_distance;
-#else
-    return false;
-#endif
+    @if(HIGH_PRECISION) {
+        return view_distance < terrain_view.precision_distance;
+    } @else {
+        return false;
+    }
 }
 
-#ifdef VERTEX
+@if(VERTEX)
 fn compute_coordinate(vertex_index: u32) -> Coordinate {
     // use first and last indices of the rows twice, to form degenerate triangles
     let tile_index   = vertex_index / terrain_view.vertices_per_tile;
@@ -42,18 +36,16 @@ fn compute_coordinate(vertex_index: u32) -> Coordinate {
 
     return Coordinate(tile.face, tile.lod, tile.xy, mix(tile_uv, even_uv, morph_ratio));
 }
-#endif
 
-#ifdef FRAGMENT
+@if(FRAGMENT)
 fn compute_coordinate(tile_index: u32, tile_uv: vec2<f32>) -> Coordinate {
     let tile = geometry_tiles[tile_index];
 
     return Coordinate(tile.face, tile.lod, tile.xy, tile_uv, dpdx(tile_uv), dpdy(tile_uv));
 }
-#endif
 
 
-#ifdef PREPASS
+@if(PREPASS)
 fn compute_world_coordinate(coordinate: Coordinate) -> WorldCoordinate {
     var world_coordinate = compute_world_coordinate_imprecise(coordinate, approximate_height);
 
@@ -63,9 +55,8 @@ fn compute_world_coordinate(coordinate: Coordinate) -> WorldCoordinate {
 
     return world_coordinate;
 }
-#endif
 
-#ifdef VERTEX
+@if(VERTEX)
 fn compute_world_coordinate(coordinate: Coordinate, tile_index: u32, tile_uv: vec2<f32>) -> WorldCoordinate {
     let tile          = geometry_tiles[tile_index];
     let view_distance = mix(mix(tile.view_distances.x, tile.view_distances.y, tile_uv.x),
@@ -74,23 +65,23 @@ fn compute_world_coordinate(coordinate: Coordinate, tile_index: u32, tile_uv: ve
     if (high_precision(view_distance)) { return compute_world_coordinate_precise(coordinate, approximate_height); }
     else {                               return compute_world_coordinate_imprecise(coordinate, approximate_height); }
 }
-#endif
 
-#ifdef FRAGMENT
+@if(FRAGMENT)
 fn compute_world_coordinate(coordinate: Coordinate, height: f32, view_distance: f32) -> WorldCoordinate {
     if (high_precision(view_distance)) { return compute_world_coordinate_precise(coordinate, height); }
     else {                               return compute_world_coordinate_imprecise(coordinate, height); }
 }
-#endif
 
 fn compute_world_coordinate_imprecise(coordinate: Coordinate, height: f32) -> WorldCoordinate {
     let uv = (vec2<f32>(coordinate.xy) + coordinate.uv) / exp2(f32(coordinate.lod));
 
-#ifdef SPHERICAL
+    @if(SPHERICAL)
     let xy = (2.0 * uv - 1.0) / sqrt(1.0 - 4.0 * SIGMA * (uv - 1.0) * uv);
 
     // this is faster than the CPU SIDE_MATRICES approach
+    @if(SPHERICAL)
     var unit_position: vec3<f32>;
+    @if(SPHERICAL)
     switch (coordinate.face) {
         case 0u: { unit_position = vec3( -1.0, -xy.y,  xy.x); }
         case 1u: { unit_position = vec3( xy.x, -xy.y,   1.0); }
@@ -100,13 +91,15 @@ fn compute_world_coordinate_imprecise(coordinate: Coordinate, height: f32) -> Wo
         case 5u: { unit_position = vec3( xy.y,  -1.0,  xy.x); }
         case default: {}
     }
-
-    unit_position   = normalize(unit_position);
+    @if(SPHERICAL)
+    unit_position = normalize(unit_position);
+    @if(SPHERICAL)
     let unit_normal = unit_position;
-#else
+
+    @if(!SPHERICAL)
     let unit_position = vec3<f32>(uv.x - 0.5, 0.0, uv.y - 0.5);
+    @if(!SPHERICAL)
     let unit_normal   = vec3<f32>(0.0, 1.0, 0.0);
-#endif
 
     let position_world_from_unit = affine3_to_square(terrain_data.terrain.world_from_unit);
     let world_position           = (position_world_from_unit * vec4<f32>(unit_position, 1.0)).xyz;
@@ -119,7 +112,7 @@ fn compute_world_coordinate_imprecise(coordinate: Coordinate, height: f32) -> Wo
     return WorldCoordinate(world_position, world_normal, view_distance);
 }
 
-#ifdef HIGH_PRECISION
+@if(HIGH_PRECISION)
 fn compute_world_coordinate_precise(coordinate: Coordinate, height: f32) -> WorldCoordinate {
     let view_coordinate = compute_view_coordinate(coordinate.face, coordinate.lod);
 
@@ -137,9 +130,8 @@ fn compute_world_coordinate_precise(coordinate: Coordinate, height: f32) -> Worl
 
     return WorldCoordinate(world_position, world_normal, view_distance);
 }
-#else
+@if(!HIGH_PRECISION)
 fn compute_world_coordinate_precise(coordinate: Coordinate, height: f32) -> WorldCoordinate { return WorldCoordinate(vec3<f32>(0.0), vec3<f32>(0.0), 0.0); }
-#endif
 
 fn compute_tangent_space(world_coordinate: WorldCoordinate) -> TangentSpace {
     let position_dx = dpdx(world_coordinate.position);
@@ -161,23 +153,22 @@ fn inverse_mix(a: f32, b: f32, value: f32) -> f32 {
 }
 
 fn compute_morph(lod: u32, view_distance: f32) -> f32 {
-#ifdef MORPH
-    let target_lod = log2(terrain_view.morph_distance / view_distance);
+    @if(MORPH) {
+        let target_lod = log2(terrain_view.morph_distance / view_distance);
 
-    return select(saturate(1.0 - (target_lod - f32(lod)) / terrain_view.morph_range), 0.0, lod == 0);
-#else
-    return 0.0;
-#endif
+        return select(saturate(1.0 - (target_lod - f32(lod)) / terrain_view.morph_range), 0.0, lod == 0);
+    } @else {
+        return 0.0;
+    }
 }
 
 fn compute_blend(view_distance: f32) -> Blend {
     let target_lod = log2(terrain_view.blend_distance / view_distance);
 
-#ifdef BLEND
+    @if(BLEND)
     let ratio = saturate(1.0 - fract(target_lod) / terrain_view.blend_range);
-#else
+    @if(!BLEND)
     let ratio = 0.0;
-#endif
 
     return Blend(min(u32(target_lod), terrain_data.terrain.lod_count - 1), select(ratio, 0.0, target_lod < 1 || u32(target_lod) >= terrain_data.terrain.lod_count));
 }
@@ -185,11 +176,10 @@ fn compute_blend(view_distance: f32) -> Blend {
 fn compute_view_coordinate(face: u32, lod: u32) -> Coordinate {
     let coordinate = terrain_view.coordinates[face];
 
-#ifdef FRAGMENT
+    @if(FRAGMENT)
     var view_coordinate = Coordinate(face, terrain_view.lod, coordinate.xy, coordinate.uv, vec2<f32>(0.0), vec2<f32>(0.0));
-#else
+    @if(!FRAGMENT)
     var view_coordinate = Coordinate(face, terrain_view.lod, coordinate.xy, coordinate.uv);
-#endif
 
     coordinate_change_lod(&view_coordinate, lod);
 
@@ -207,11 +197,11 @@ fn compute_subdivision_coordinate(tile: TileCoordinate) -> Coordinate {
     if      (offset.y < 0) { uv.y = 0.0; }
     else if (offset.y > 0) { uv.y = 1.0; }
 
-#ifdef FRAGMENT
-    return Coordinate(tile.face, tile.lod, tile.xy, uv, vec2<f32>(0.0), vec2<f32>(0.0));
-#else
-    return Coordinate(tile.face, tile.lod, tile.xy, uv);
-#endif
+    @if(FRAGMENT) {
+        return Coordinate(tile.face, tile.lod, tile.xy, uv, vec2<f32>(0.0), vec2<f32>(0.0));
+    } @else {
+        return Coordinate(tile.face, tile.lod, tile.xy, uv);
+    }
 }
 
 fn coordinate_change_lod(coordinate: ptr<function, Coordinate>, new_lod: u32) {
@@ -227,10 +217,10 @@ fn coordinate_change_lod(coordinate: ptr<function, Coordinate>, new_lod: u32) {
     (*coordinate).xy = vec2<u32>(vec2<f32>(xy) * scale) + vec2<u32>(uv);
     (*coordinate).uv = uv % 1.0 + select(vec2<f32>(xy % u32(1 / scale)) * scale, vec2<f32>(0.0), lod_difference > 0);
 
-#ifdef FRAGMENT
-    (*coordinate).uv_dx *= scale;
-    (*coordinate).uv_dy *= scale;
-#endif
+    @if(FRAGMENT) {
+        (*coordinate).uv_dx *= scale;
+        (*coordinate).uv_dy *= scale;
+    }
 }
 
 fn compute_tile_tree_uv(coordinate: Coordinate) -> vec2<f32> {
@@ -280,17 +270,17 @@ fn lookup_best(lookup_coordinate: Coordinate) -> BestLookup {
 }
 
 fn lookup_tile(lookup_coordinate: Coordinate, blend: Blend) -> AtlasTile {
-#ifdef TILE_TREE_LOD
-    return lookup_best(lookup_coordinate).tile;
-#else
-    var coordinate = lookup_coordinate;
+    @if(TILE_TREE_LOD) {
+        return lookup_best(lookup_coordinate).tile;
+    } @else {
+        var coordinate = lookup_coordinate;
 
-    coordinate_change_lod(&coordinate, blend.lod);
+        coordinate_change_lod(&coordinate, blend.lod);
 
-    let tile_tree_entry = lookup_tile_tree_entry(coordinate);
+        let tile_tree_entry = lookup_tile_tree_entry(coordinate);
 
-    coordinate_change_lod(&coordinate, tile_tree_entry.atlas_lod);
+        coordinate_change_lod(&coordinate, tile_tree_entry.atlas_lod);
 
-    return AtlasTile(tile_tree_entry.atlas_index, coordinate, blend.ratio);
-#endif
+        return AtlasTile(tile_tree_entry.atlas_index, coordinate, blend.ratio);
+    }
 }

@@ -1,6 +1,4 @@
-#define_import_path bevy_terrain::terrain_shadow
-
-#import bevy_terrain::types::TerrainShadow
+import bevy_terrain::shaders::types::TerrainShadow;
 
 // Samples the RDR2-style terrain shadow map: compares the point's elevation
 // above the ellipsoid with the raymarched intersection height (R), fading over

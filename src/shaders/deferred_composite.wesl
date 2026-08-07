@@ -1,4 +1,4 @@
-#import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
+import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
 
 // Restages the terrain's privately rendered G-buffer into Bevy's deferred
 // prepass attachments. The terrain draw can't target those attachments

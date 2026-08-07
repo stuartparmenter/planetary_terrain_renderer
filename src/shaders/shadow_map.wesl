@@ -4,8 +4,8 @@
 // stored. At shading time fragments compare their elevation against R and use G to
 // widen the penumbra for cheap soft shadows.
 
-#import bevy_terrain::bindings::{terrain_shadow, shadow_map_out}
-#import bevy_terrain::heightfield::sample_height_at_world
+import bevy_terrain::shaders::bindings::{terrain_shadow, shadow_map_out};
+import bevy_terrain::shaders::heightfield::sample_height_at_world;
 
 // Elevation sentinel meaning "no occluder" (well below any terrain, fits rg16float).
 const NO_OCCLUDER: f32 = -60000.0;

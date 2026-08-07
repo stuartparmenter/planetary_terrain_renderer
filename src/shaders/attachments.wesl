@@ -1,9 +1,7 @@
-#define_import_path bevy_terrain::attachments
+import bevy_terrain::shaders::types::{AtlasTile, TangentSpace, AttachmentConfig, SampleUV, WorldCoordinate};
+import bevy_terrain::shaders::bindings::{terrain_data, terrain_view, terrain_sampler, height_attachment};
 
-#import bevy_terrain::types::{AtlasTile, TangentSpace, AttachmentConfig, SampleUV, WorldCoordinate}
-#import bevy_terrain::bindings::{terrain_data, terrain_view, terrain_sampler, height_attachment}
-
-#ifdef FRAGMENT
+@if(FRAGMENT)
 fn compute_sample_uv(tile: AtlasTile, attachment: AttachmentConfig) -> SampleUV {
     let uv    = tile.coordinate.uv * attachment.scale + attachment.offset;
     let lod   = log2(attachment.texture_size * max(length(tile.coordinate.uv_dx), length(tile.coordinate.uv_dy)));
@@ -13,13 +11,12 @@ fn compute_sample_uv(tile: AtlasTile, attachment: AttachmentConfig) -> SampleUV 
 
     return SampleUV(uv, dx, dy);
 }
-#else
+@if(!FRAGMENT)
 fn compute_sample_uv(tile: AtlasTile, attachment: AttachmentConfig) -> SampleUV {
     let uv = tile.coordinate.uv * attachment.scale + attachment.offset;
 
     return SampleUV(uv);
 }
-#endif
 
 // Samples an arbitrary attachment at the tile's coordinate, applying the same LOD / blend
 // handling as height sampling. Pass the attachment's config (`terrain_data.attachments.<label>`)
@@ -34,15 +31,13 @@ fn compute_sample_uv(tile: AtlasTile, attachment: AttachmentConfig) -> SampleUV 
 fn sample_attachment(attachment: AttachmentConfig, attachment_texture: texture_2d_array<f32>, tile: AtlasTile) -> vec4<f32> {
     let uv = compute_sample_uv(tile, attachment);
 
-#ifdef FRAGMENT
-#ifdef SAMPLE_GRAD
-    return textureSampleGrad(attachment_texture, terrain_sampler, uv.uv, tile.index, uv.dx, uv.dy);
-#else
-    return textureSampleLevel(attachment_texture, terrain_sampler, uv.uv, tile.index, tile.blend_ratio);
-#endif
-#else
-    return textureSampleLevel(attachment_texture, terrain_sampler, uv.uv, tile.index, 0.0);
-#endif
+    @if(FRAGMENT && SAMPLE_GRAD) {
+        return textureSampleGrad(attachment_texture, terrain_sampler, uv.uv, tile.index, uv.dx, uv.dy);
+    } @elif(FRAGMENT) {
+        return textureSampleLevel(attachment_texture, terrain_sampler, uv.uv, tile.index, tile.blend_ratio);
+    } @else {
+        return textureSampleLevel(attachment_texture, terrain_sampler, uv.uv, tile.index, 0.0);
+    }
 }
 
 fn sample_height(tile: AtlasTile) -> f32 {
@@ -61,22 +56,25 @@ fn sample_height_mask(tile: AtlasTile) -> bool {
     return any(mask == vec4<u32>(0));
 }
 
-#ifdef FRAGMENT
+@if(FRAGMENT)
 fn sample_surface_gradient(tile: AtlasTile, tangent_space: TangentSpace) -> vec3<f32> {
     let attachment = terrain_data.attachments.height;
     let uv         = compute_sample_uv(tile, attachment);
     let scale      = max(length(uv.dx), length(uv.dy));
     let step       = 0.5 * scale;
 
-#ifdef SAMPLE_GRAD
+    @if(SAMPLE_GRAD)
     let height   = textureSampleGrad(height_attachment, terrain_sampler, uv.uv + vec2<f32>(-step, -step), tile.index, uv.dx, uv.dy).x;
+    @if(SAMPLE_GRAD)
     let height_u = textureSampleGrad(height_attachment, terrain_sampler, uv.uv + vec2<f32>( step, -step), tile.index, uv.dx, uv.dy).x;
+    @if(SAMPLE_GRAD)
     let height_v = textureSampleGrad(height_attachment, terrain_sampler, uv.uv + vec2<f32>(-step,  step), tile.index, uv.dx, uv.dy).x;
-#else
+    @if(!SAMPLE_GRAD)
     let height   = textureSampleLevel(height_attachment, terrain_sampler, uv.uv + vec2<f32>(-step, -step), tile.index, tile.blend_ratio).x;
+    @if(!SAMPLE_GRAD)
     let height_u = textureSampleLevel(height_attachment, terrain_sampler, uv.uv + vec2<f32>( step, -step), tile.index, tile.blend_ratio).x;
+    @if(!SAMPLE_GRAD)
     let height_v = textureSampleLevel(height_attachment, terrain_sampler, uv.uv + vec2<f32>(-step,  step), tile.index, tile.blend_ratio).x;
-#endif
 
     var height_duv = vec2<f32>(height_u - height, height_v - height) / scale;
 
@@ -119,7 +117,6 @@ fn sample_surface_gradient(tile: AtlasTile, tangent_space: TangentSpace) -> vec3
 
     return terrain_data.terrain.height_scale * tangent_space.scale * (height_dx * tangent_space.tangent_x + height_dy * tangent_space.tangent_y);
 }
-#endif
 
 fn compute_slope(world_normal: vec3<f32>, surface_gradient: vec3<f32>) -> f32 {
     let normal  = normalize(world_normal - surface_gradient);

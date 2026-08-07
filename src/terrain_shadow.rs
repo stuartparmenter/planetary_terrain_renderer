@@ -81,10 +81,15 @@ pub(crate) fn update_terrain_shadow(
     settings: Res<TerrainShadowSettings>,
     tile_trees: Res<TerrainViewComponents<TileTree>>,
     tile_atlases: Query<&TileAtlas>,
-    lights: Query<&GlobalTransform, With<DirectionalLight>>,
+    lights: Query<(&DirectionalLight, &GlobalTransform)>,
     mut uniforms: ResMut<TerrainViewComponents<TerrainShadowUniform>>,
 ) {
-    let light = lights.iter().next();
+    // With several directional lights (sun + moon), march towards the one
+    // that dominates shading.
+    let light = lights
+        .iter()
+        .max_by(|(a, _), (b, _)| a.illuminance.total_cmp(&b.illuminance))
+        .map(|(_, transform)| transform);
 
     for (&(terrain, view), tile_tree) in tile_trees.iter() {
         let Ok(tile_atlas) = tile_atlases.get(terrain) else {

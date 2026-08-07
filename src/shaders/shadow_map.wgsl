@@ -69,6 +69,14 @@ fn compute_shadow_map(@builtin(global_invocation_id) invocation: vec3<u32>) {
         ray_length          = terrain_shadow.texel_size;
     }
 
+    // Clamp both channels into rg16float's finite range (+-65504): with the
+    // light below the horizon the accumulated occlusion height grows past it,
+    // and `ray_length` starts at `max_distance`, which the settings allow
+    // beyond 65 km. An out-of-range store converts to Inf on some drivers,
+    // which the decode would turn into NaN. +-60000 decodes identically:
+    // R = -60000 is the no-occluder sentinel, +60000 is fully occluded, and a
+    // 60 km ray length already exceeds any visible penumbra width.
     textureStore(shadow_map_out, vec2<i32>(invocation.xy),
-                 vec4<f32>(intersection_height, ray_length, 0.0, 0.0));
+                 vec4<f32>(clamp(intersection_height, NO_OCCLUDER, 60000.0),
+                           min(ray_length, 60000.0), 0.0, 0.0));
 }

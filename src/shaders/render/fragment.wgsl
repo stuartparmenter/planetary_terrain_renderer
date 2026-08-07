@@ -4,6 +4,7 @@
 #import bevy_terrain::bindings::{terrain_data, terrain_view, geometry_tiles}
 #ifdef TERRAIN_SHADOW
 #import bevy_terrain::bindings::{shadow_map, shadow_map_sampler, terrain_shadow}
+#import bevy_terrain::terrain_shadow::terrain_shadow_factor_at
 #endif
 #import bevy_terrain::functions::{compute_coordinate, compute_world_coordinate, compute_blend, compute_tangent_space, lookup_tile, apply_height, high_precision}
 #import bevy_terrain::attachments::{sample_height_mask, sample_surface_gradient}
@@ -61,30 +62,18 @@ fn fragment_info(input: FragmentInput) -> FragmentInfo{
 }
 
 #ifdef TERRAIN_SHADOW
-// Samples the RDR2-style terrain shadow map: compares the fragment's elevation above
-// the ellipsoid with the raymarched intersection height (R), fading over a penumbra
-// width derived from the ray length to the occluder (G).
+// Samples the RDR2-style terrain shadow map through the terrain view bind
+// group; the decode itself lives in `bevy_terrain::terrain_shadow`.
 fn terrain_shadow_factor(world_position: vec3<f32>) -> f32 {
-    if (terrain_shadow.enabled == 0u) { return 1.0; }
+    return terrain_shadow_factor_at(world_position, terrain_shadow, shadow_map, shadow_map_sampler);
+}
 
-    let delta      = world_position - terrain_shadow.center;
-    let horizontal = vec2<f32>(dot(delta, terrain_shadow.east), dot(delta, terrain_shadow.north));
-    let uv         = horizontal / (2.0 * terrain_shadow.extent) + 0.5;
-
-    // Elevation above the ellipsoid, reconstructed from the tangent frame with the
-    // spherical curvature drop added back.
-    let elevation = dot(delta, terrain_shadow.up) + dot(horizontal, horizontal) * terrain_shadow.curvature;
-
-    let shadow     = textureSampleLevel(shadow_map, shadow_map_sampler, uv, 0.0);
-    let penumbra   = max(terrain_shadow.min_penumbra, shadow.g * terrain_shadow.penumbra_scale);
-    let visibility = smoothstep(0.0, 1.0, (elevation - shadow.r) / penumbra + 0.5);
-
-    // Fade out towards the edge of the map, so shadows vanish smoothly instead of
-    // being cut off.
-    let border = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
-    let fade   = 1.0 - smoothstep(0.9, 1.0, border);
-
-    return mix(1.0, visibility, fade);
+// Applies the map to a `PbrInput`: the factor paired with the direction of
+// the light it was marched for, which scopes it to that light inside
+// `apply_pbr_lighting`.
+fn apply_terrain_shadow(pbr_input: ptr<function, PbrInput>, world_position: vec3<f32>) {
+    (*pbr_input).directional_shadow_factor = terrain_shadow_factor(world_position);
+    (*pbr_input).directional_shadow_direction = terrain_shadow.light_direction;
 }
 #endif
 
@@ -117,7 +106,7 @@ fn fragment_output(info: ptr<function, FragmentInfo>, output: ptr<function, Frag
 #else
     pbr_input.V = calculate_view(world_position, pbr_input.is_orthographic);
 #ifdef TERRAIN_SHADOW
-    pbr_input.directional_shadow_factor = terrain_shadow_factor(world_position.xyz);
+    apply_terrain_shadow(&pbr_input, world_position.xyz);
 #endif
 
     (*output).color = apply_pbr_lighting(pbr_input);

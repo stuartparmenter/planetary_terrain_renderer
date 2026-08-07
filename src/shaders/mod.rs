@@ -66,6 +66,7 @@ pub(crate) fn load_terrain_shaders(app: &mut App, attachments: &[AttachmentLabel
     embedded_asset!(app, "functions.wgsl");
     embedded_asset!(app, "heightfield.wgsl");
     embedded_asset!(app, "shadow_map.wgsl");
+    embedded_asset!(app, "terrain_shadow.wgsl");
     embedded_asset!(app, "debug.wgsl");
     embedded_asset!(app, "render/vertex.wgsl");
     embedded_asset!(app, "render/fragment.wgsl");
@@ -86,6 +87,7 @@ pub(crate) fn load_terrain_shaders(app: &mut App, attachments: &[AttachmentLabel
             "embedded://bevy_terrain/shaders/attachments.wgsl",
             "embedded://bevy_terrain/shaders/functions.wgsl",
             "embedded://bevy_terrain/shaders/heightfield.wgsl",
+            "embedded://bevy_terrain/shaders/terrain_shadow.wgsl",
             "embedded://bevy_terrain/shaders/debug.wgsl",
             "embedded://bevy_terrain/shaders/render/vertex.wgsl",
             "embedded://bevy_terrain/shaders/render/fragment.wgsl",

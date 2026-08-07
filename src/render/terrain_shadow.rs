@@ -21,6 +21,10 @@ use bevy::{
 
 const SHADOW_MAP_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
+/// f16 bit pattern of `NO_OCCLUDER` in `shadow_map.wgsl` (-60000.0);
+/// pinned by the `no_occluder_bits_match_sentinel` test.
+const NO_OCCLUDER_F16_BITS: u16 = 0xFB53;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TerrainShadowPipelineKey {
     pub spherical: bool,
@@ -131,8 +135,27 @@ pub struct GpuTerrainShadow {
 }
 
 impl GpuTerrainShadow {
+    /// The shadow map texture view. Created once per (terrain, view) and
+    /// stable until the terrain despawns; the raymarch pass rewrites the
+    /// contents in place, so external bind groups can hold onto it.
+    pub fn texture_view(&self) -> &TextureView {
+        &self.texture_view
+    }
+
+    /// The linear clamp-to-edge sampler for the shadow map.
+    pub fn sampler(&self) -> &Sampler {
+        &self.sampler
+    }
+
+    /// The `TerrainShadowUniform` GPU buffer. Stable like the texture; its
+    /// contents are re-uploaded every frame in `prepare`.
+    pub fn params_buffer(&self) -> &Buffer {
+        &self.params_buffer
+    }
+
     fn new(
         device: &RenderDevice,
+        queue: &RenderQueue,
         pipeline_cache: &PipelineCache,
         pipelines: &TerrainShadowPipelines,
         tile_tree: &TileTree,
@@ -140,20 +163,35 @@ impl GpuTerrainShadow {
     ) -> Self {
         let map_size = settings.map_size;
 
-        let texture = device.create_texture(&TextureDescriptor {
-            label: Some("terrain_shadow_map"),
-            size: Extent3d {
-                width: map_size,
-                height: map_size,
-                depth_or_array_layers: 1,
+        // Seeded with the no-occluder encoding so the map decodes as fully
+        // lit until the raymarch's first dispatch: the compute pipeline
+        // compiles asynchronously, and the map stays bound (with stale
+        // contents) while `enabled` is off. R = the NO_OCCLUDER sentinel,
+        // all other channels zero.
+        let mut texel_bytes = [0u8; 8];
+        texel_bytes[..2].copy_from_slice(&NO_OCCLUDER_F16_BITS.to_le_bytes());
+        let texture = device.create_texture_with_data(
+            queue,
+            &TextureDescriptor {
+                label: Some("terrain_shadow_map"),
+                size: Extent3d {
+                    width: map_size,
+                    height: map_size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: SHADOW_MAP_FORMAT,
+                usage: TextureUsages::STORAGE_BINDING
+                    | TextureUsages::TEXTURE_BINDING
+                    | TextureUsages::COPY_DST,
+                view_formats: &[],
             },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: SHADOW_MAP_FORMAT,
-            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
+            TextureDataOrder::default(),
+            &texel_bytes.repeat((map_size * map_size) as usize),
+        );
+
         let texture_view = texture.create_view(&TextureViewDescriptor::default());
 
         let sampler = device.create_sampler(&SamplerDescriptor {
@@ -199,6 +237,7 @@ impl GpuTerrainShadow {
 
     pub(crate) fn initialize(
         device: Res<RenderDevice>,
+        queue: Res<RenderQueue>,
         pipeline_cache: Res<PipelineCache>,
         pipelines: Res<TerrainShadowPipelines>,
         settings: Res<TerrainShadowSettings>,
@@ -212,7 +251,14 @@ impl GpuTerrainShadow {
 
             gpu_terrain_shadows.insert(
                 (terrain, view),
-                GpuTerrainShadow::new(&device, &pipeline_cache, &pipelines, tile_tree, &settings),
+                GpuTerrainShadow::new(
+                    &device,
+                    &queue,
+                    &pipeline_cache,
+                    &pipelines,
+                    tile_tree,
+                    &settings,
+                ),
             );
         }
     }
@@ -317,5 +363,17 @@ pub fn terrain_shadow_pass(
 
         let workgroups = gpu_terrain_shadow.map_size.div_ceil(8);
         pass.dispatch_workgroups(workgroups, workgroups, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NO_OCCLUDER_F16_BITS;
+
+    /// Pins the hard-coded bit pattern to the `NO_OCCLUDER` sentinel in
+    /// `shadow_map.wgsl`; change them together.
+    #[test]
+    fn no_occluder_bits_match_sentinel() {
+        assert_eq!(half::f16::from_f32(-60000.0).to_bits(), NO_OCCLUDER_F16_BITS);
     }
 }

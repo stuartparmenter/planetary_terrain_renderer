@@ -78,3 +78,6 @@ wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "a03be8d2232ad3507b69e431
 wgpu-types = { git = "https://github.com/gfx-rs/wgpu", rev = "a03be8d2232ad3507b69e431c02e483a5ea792d0" }
 wgpu-naga-bridge = { git = "https://github.com/gfx-rs/wgpu", rev = "a03be8d2232ad3507b69e431c02e483a5ea792d0" }
 naga = { git = "https://github.com/gfx-rs/wgpu", rev = "a03be8d2232ad3507b69e431c02e483a5ea792d0" }
+
+[dev-dependencies]
+half = "2"

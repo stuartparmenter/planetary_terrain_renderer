@@ -479,7 +479,7 @@ pub(crate) fn queue_terrain<M: Material>(
     {
         let Some(terrain_phase) = terrain_phases.get_mut(&RetainedViewEntity {
             main_entity: view.into(),
-            auxiliary_entity: Entity::PLACEHOLDER.into(),
+            auxiliary_entity: None,
             subview_index: 0,
         }) else {
             continue;

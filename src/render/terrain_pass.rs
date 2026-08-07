@@ -126,7 +126,7 @@ pub fn extract_terrain_phases(
         terrain_phases.insert(
             RetainedViewEntity {
                 main_entity: entity.into(),
-                auxiliary_entity: Entity::PLACEHOLDER.into(),
+                auxiliary_entity: None,
                 subview_index: 0,
             },
             default(),
